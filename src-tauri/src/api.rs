@@ -1,12 +1,18 @@
-use keyring::Entry;
-use reqwest::{Client, Method, Response};
+use keyring::{Entry, Error as KeyringError};
+use reqwest::{Client, Method, Response, StatusCode, Url};
 use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 const KEYCHAIN_SERVICE: &str = "net.accly.launcher";
 const KEYCHAIN_ACCOUNT: &str = "device-session";
+const PRODUCTION_AUTH_ORIGIN: &str = "https://auth.accly.net";
+const PRODUCTION_CORE_ORIGIN: &str = "https://core.accly.net";
+const MIN_POLL_INTERVAL_SECONDS: u64 = 2;
+const SLOW_DOWN_INTERVAL_INCREMENT_SECONDS: u64 = 5;
+const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,10 +25,22 @@ pub struct DeviceCode {
     pub interval: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherSession {
     pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum DeviceAuthorizationPoll {
+    Pending {
+        #[serde(rename = "retryAfterSeconds")]
+        retry_after_seconds: u64,
+    },
+    Completed {
+        session: LauncherSession,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +113,13 @@ struct DeviceTokenResponse {
 }
 
 #[derive(Deserialize)]
+struct DeviceTokenErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeyResponse {
     prefix: String,
@@ -120,24 +145,34 @@ struct Endpoints {
 }
 
 impl Endpoints {
-    fn load() -> Self {
-        Self {
-            auth: configured_value(
+    fn load() -> Result<Self, String> {
+        Ok(Self {
+            auth: validate_endpoint(
                 "ACCLY_AUTH_URL",
-                option_env!("ACCLY_AUTH_URL"),
-                "https://auth.accly.net",
-            ),
-            core: configured_value(
+                &configured_value(
+                    "ACCLY_AUTH_URL",
+                    option_env!("ACCLY_AUTH_URL"),
+                    PRODUCTION_AUTH_ORIGIN,
+                ),
+                PRODUCTION_AUTH_ORIGIN,
+                cfg!(debug_assertions),
+            )?,
+            core: validate_endpoint(
                 "ACCLY_CORE_URL",
-                option_env!("ACCLY_CORE_URL"),
-                "https://core.accly.net",
-            ),
+                &configured_value(
+                    "ACCLY_CORE_URL",
+                    option_env!("ACCLY_CORE_URL"),
+                    PRODUCTION_CORE_ORIGIN,
+                ),
+                PRODUCTION_CORE_ORIGIN,
+                cfg!(debug_assertions),
+            )?,
             client_id: configured_value(
                 "ACCLY_LAUNCHER_CLIENT_ID",
                 option_env!("ACCLY_LAUNCHER_CLIENT_ID"),
                 "accly-launcher",
             ),
-        }
+        })
     }
 
     fn auth_route(&self, route: &str) -> String {
@@ -147,6 +182,10 @@ impl Endpoints {
     fn core_route(&self, route: &str) -> String {
         format!("{}{}", self.core.trim_end_matches('/'), route)
     }
+
+    fn launcher_session_route(&self) -> String {
+        self.auth_route("/api/auth/launcher/session")
+    }
 }
 
 fn configured_value(name: &str, compiled: Option<&str>, fallback: &str) -> String {
@@ -155,6 +194,88 @@ fn configured_value(name: &str, compiled: Option<&str>, fallback: &str) -> Strin
         .filter(|value| !value.is_empty())
         .or_else(|| compiled.map(ToString::to_string))
         .unwrap_or_else(|| fallback.to_string())
+}
+
+fn validate_endpoint(
+    name: &str,
+    value: &str,
+    expected_origin: &str,
+    allow_localhost: bool,
+) -> Result<String, String> {
+    let parsed = Url::parse(value).map_err(|_| format!("{name} must be an absolute HTTPS URL."))?;
+
+    if !is_root_url(&parsed) {
+        return Err(format!(
+            "{name} must not include a path, query, or fragment."
+        ));
+    }
+
+    if allow_localhost && is_localhost_url(&parsed) {
+        return Ok(parsed.origin().ascii_serialization());
+    }
+
+    if parsed.scheme() != "https" || parsed.origin().ascii_serialization() != expected_origin {
+        return Err(format!(
+            "{name} must use {expected_origin} outside local debug builds."
+        ));
+    }
+
+    Ok(expected_origin.to_string())
+}
+
+fn is_root_url(url: &Url) -> bool {
+    url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn is_localhost_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && matches!(
+            url.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+        )
+}
+
+fn validate_verification_uri(
+    value: &str,
+    auth_origin: &str,
+    requires_user_code: bool,
+) -> Result<String, String> {
+    let parsed = Url::parse(value)
+        .map_err(|_| "Auth returned an invalid launcher verification URL.".to_string())?;
+
+    if parsed.origin().ascii_serialization() != auth_origin
+        || parsed.path() != "/device"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Auth returned an untrusted launcher verification URL.".to_string());
+    }
+
+    let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
+    if requires_user_code {
+        let valid_user_code = query_pairs.len() == 1
+            && query_pairs[0].0 == "user_code"
+            && is_valid_user_code(query_pairs[0].1.as_ref());
+        if !valid_user_code {
+            return Err("Auth returned an invalid launcher verification code URL.".to_string());
+        }
+    } else if !query_pairs.is_empty() {
+        return Err("Auth returned an invalid launcher verification URL.".to_string());
+    }
+
+    Ok(parsed.to_string())
+}
+
+fn is_valid_user_code(value: &str) -> bool {
+    (4..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
 fn default_expires_in() -> u64 {
@@ -182,7 +303,10 @@ fn read_session_token() -> Result<Option<String>, String> {
     match entry.get_password() {
         Ok(token) if !token.is_empty() => Ok(Some(token)),
         Ok(_) => Ok(None),
-        Err(_) => Ok(None),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Unable to read the launcher session from macOS Keychain: {error}"
+        )),
     }
 }
 
@@ -196,14 +320,38 @@ pub fn get_launcher_session() -> Result<Option<LauncherSession>, String> {
     Ok(read_session_token()?.map(|_| LauncherSession { expires_at: None }))
 }
 
-pub fn clear_launcher_session() -> Result<(), String> {
+pub async fn clear_launcher_session() -> Result<(), String> {
+    if let Some(token) = read_session_token()? {
+        revoke_launcher_session(&token).await;
+    }
+
     let entry = session_entry()?;
-    let _ = entry.delete_credential();
-    Ok(())
+    match entry.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "Unable to remove the launcher session from macOS Keychain: {error}"
+        )),
+    }
+}
+
+async fn revoke_launcher_session(token: &str) {
+    let Ok(endpoints) = Endpoints::load() else {
+        return;
+    };
+    let Ok(http_client) = client() else {
+        return;
+    };
+
+    let _ = http_client
+        .delete(endpoints.launcher_session_route())
+        .bearer_auth(token)
+        .timeout(SESSION_REVOCATION_TIMEOUT)
+        .send()
+        .await;
 }
 
 pub async fn begin_device_authorization() -> Result<DeviceCode, String> {
-    let endpoints = Endpoints::load();
+    let endpoints = Endpoints::load()?;
     let response = client()?
         .post(endpoints.auth_route("/api/auth/device/code"))
         .json(&json!({
@@ -213,21 +361,38 @@ pub async fn begin_device_authorization() -> Result<DeviceCode, String> {
         .send()
         .await
         .map_err(|error| format!("Unable to start device authorization: {error}"))?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(
+            "Accly Launcher sign-in is not enabled on the authentication service yet.".to_string(),
+        );
+    }
     let payload: DeviceCodeResponse = response_json(response).await?;
+    if !is_valid_user_code(&payload.user_code) {
+        return Err("Auth returned an invalid launcher verification code.".to_string());
+    }
+
+    let verification_uri =
+        validate_verification_uri(&payload.verification_uri, &endpoints.auth, false)?;
+    let verification_uri_complete = payload
+        .verification_uri_complete
+        .as_deref()
+        .map(|value| validate_verification_uri(value, &endpoints.auth, true))
+        .transpose()?;
+
     Ok(DeviceCode {
         device_code: payload.device_code,
         user_code: payload.user_code,
-        verification_uri: payload.verification_uri,
-        verification_uri_complete: payload.verification_uri_complete,
+        verification_uri,
+        verification_uri_complete,
         expires_in: payload.expires_in,
-        interval: payload.interval,
+        interval: payload.interval.max(MIN_POLL_INTERVAL_SECONDS),
     })
 }
 
 pub async fn poll_device_authorization(
     device_code: DeviceCode,
-) -> Result<Option<LauncherSession>, String> {
-    let endpoints = Endpoints::load();
+) -> Result<DeviceAuthorizationPoll, String> {
+    let endpoints = Endpoints::load()?;
     let response = client()?
         .post(endpoints.auth_route("/api/auth/device/token"))
         .json(&json!({
@@ -238,9 +403,53 @@ pub async fn poll_device_authorization(
         .send()
         .await
         .map_err(|error| format!("Unable to complete device authorization: {error}"))?;
-    let payload: DeviceTokenResponse = response_json(response).await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if let Ok(error) = serde_json::from_str::<DeviceTokenErrorResponse>(&body) {
+            if let Some(poll) = nonterminal_device_poll(&error, device_code.interval) {
+                return Ok(poll);
+            }
+
+            return Err(device_token_error_message(&error));
+        }
+
+        return Err(response_error_from_body(status, &body));
+    }
+
+    let payload: DeviceTokenResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("Accly returned an invalid response: {error}"))?;
     store_session_token(&payload.access_token)?;
-    Ok(Some(LauncherSession { expires_at: None }))
+    Ok(DeviceAuthorizationPoll::Completed {
+        session: LauncherSession { expires_at: None },
+    })
+}
+
+fn nonterminal_device_poll(
+    error: &DeviceTokenErrorResponse,
+    interval: u64,
+) -> Option<DeviceAuthorizationPoll> {
+    let retry_after_seconds = match error.error.as_str() {
+        "authorization_pending" => interval.max(MIN_POLL_INTERVAL_SECONDS),
+        "slow_down" => interval
+            .max(MIN_POLL_INTERVAL_SECONDS)
+            .saturating_add(SLOW_DOWN_INTERVAL_INCREMENT_SECONDS),
+        _ => return None,
+    };
+
+    Some(DeviceAuthorizationPoll::Pending {
+        retry_after_seconds,
+    })
+}
+
+fn device_token_error_message(error: &DeviceTokenErrorResponse) -> String {
+    if error.error_description.trim().is_empty() {
+        error.error.clone()
+    } else {
+        error.error_description.clone()
+    }
 }
 
 pub async fn get_account_snapshot() -> Result<AccountSnapshot, String> {
@@ -364,7 +573,7 @@ async fn authorized_request(
 ) -> Result<Response, String> {
     let token =
         read_session_token()?.ok_or_else(|| "Sign in to your Accly account first.".to_string())?;
-    let endpoints = Endpoints::load();
+    let endpoints = Endpoints::load()?;
     let request = client()?
         .request(method, endpoints.core_route(route))
         .bearer_auth(token);
@@ -391,6 +600,10 @@ async fn response_json<T: DeserializeOwned>(response: Response) -> Result<T, Str
 async fn response_error(response: Response) -> String {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    response_error_from_body(status, &body)
+}
+
+fn response_error_from_body(status: StatusCode, body: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(&body) {
         if let Some(message) = value
             .get("error_description")
@@ -402,6 +615,148 @@ async fn response_error(response: Response) -> String {
         }
     }
     format!("Accly request failed with {status}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        nonterminal_device_poll, validate_endpoint, validate_verification_uri,
+        DeviceAuthorizationPoll, DeviceTokenErrorResponse, Endpoints, PRODUCTION_AUTH_ORIGIN,
+        PRODUCTION_CORE_ORIGIN,
+    };
+
+    #[test]
+    fn accepts_pinned_production_endpoints_and_local_debug_endpoints() {
+        assert_eq!(
+            validate_endpoint(
+                "ACCLY_AUTH_URL",
+                "https://auth.accly.net/",
+                PRODUCTION_AUTH_ORIGIN,
+                false,
+            ),
+            Ok(PRODUCTION_AUTH_ORIGIN.to_string())
+        );
+        assert_eq!(
+            validate_endpoint(
+                "ACCLY_CORE_URL",
+                "http://localhost:4100",
+                PRODUCTION_CORE_ORIGIN,
+                true,
+            ),
+            Ok("http://localhost:4100".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_unpinned_or_non_root_endpoints() {
+        assert!(validate_endpoint(
+            "ACCLY_AUTH_URL",
+            "http://auth.accly.net",
+            PRODUCTION_AUTH_ORIGIN,
+            false,
+        )
+        .is_err());
+        assert!(validate_endpoint(
+            "ACCLY_CORE_URL",
+            "https://core.accly.net/private",
+            PRODUCTION_CORE_ORIGIN,
+            false,
+        )
+        .is_err());
+        assert!(validate_endpoint(
+            "ACCLY_AUTH_URL",
+            "https://auth.accly.net.attacker.example",
+            PRODUCTION_AUTH_ORIGIN,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_only_the_configured_device_verification_urls() {
+        assert_eq!(
+            validate_verification_uri(
+                "https://auth.accly.net/device",
+                PRODUCTION_AUTH_ORIGIN,
+                false,
+            ),
+            Ok("https://auth.accly.net/device".to_string())
+        );
+        assert!(validate_verification_uri(
+            "https://auth.accly.net/device?user_code=ACCLYDEV",
+            PRODUCTION_AUTH_ORIGIN,
+            false,
+        )
+        .is_err());
+        assert_eq!(
+            validate_verification_uri(
+                "https://auth.accly.net/device?user_code=ACCLY-DEV",
+                PRODUCTION_AUTH_ORIGIN,
+                true,
+            ),
+            Ok("https://auth.accly.net/device?user_code=ACCLY-DEV".to_string())
+        );
+        assert!(validate_verification_uri(
+            "https://attacker.example/device?user_code=ACCLY-DEV",
+            PRODUCTION_AUTH_ORIGIN,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn classifies_pending_and_slow_down_device_errors() {
+        let pending = DeviceTokenErrorResponse {
+            error: "authorization_pending".to_string(),
+            error_description: "Authorization pending".to_string(),
+        };
+        assert_eq!(
+            nonterminal_device_poll(&pending, 5),
+            Some(DeviceAuthorizationPoll::Pending {
+                retry_after_seconds: 5,
+            })
+        );
+
+        let slow_down = DeviceTokenErrorResponse {
+            error: "slow_down".to_string(),
+            error_description: "Polling too frequently".to_string(),
+        };
+        assert_eq!(
+            nonterminal_device_poll(&slow_down, 5),
+            Some(DeviceAuthorizationPoll::Pending {
+                retry_after_seconds: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_device_poll_results_for_tauri() {
+        let payload = serde_json::to_value(DeviceAuthorizationPoll::Pending {
+            retry_after_seconds: 10,
+        })
+        .expect("device authorization poll result should serialize");
+
+        assert_eq!(
+            payload,
+            json!({ "status": "pending", "retryAfterSeconds": 10 })
+        );
+    }
+
+    #[test]
+    fn builds_the_pinned_launcher_session_revocation_route() {
+        let endpoints = Endpoints {
+            auth: PRODUCTION_AUTH_ORIGIN.to_string(),
+            core: PRODUCTION_CORE_ORIGIN.to_string(),
+            client_id: "accly-launcher".to_string(),
+        };
+
+        assert_eq!(
+            endpoints.launcher_session_route(),
+            "https://auth.accly.net/api/auth/launcher/session"
+        );
+    }
 }
 
 fn response_data(value: &Value) -> &Value {

@@ -42,6 +42,16 @@ export interface LauncherSession {
   expiresAt: string | null;
 }
 
+export type DeviceAuthorizationPoll =
+  | {
+      status: "pending";
+      retryAfterSeconds: number;
+    }
+  | {
+      status: "completed";
+      session: LauncherSession;
+    };
+
 export interface PlanAccess {
   planName: string;
   paid: boolean;

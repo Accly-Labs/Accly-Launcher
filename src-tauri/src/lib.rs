@@ -7,8 +7,8 @@ fn get_launcher_session() -> Result<Option<api::LauncherSession>, String> {
 }
 
 #[tauri::command]
-fn clear_launcher_session() -> Result<(), String> {
-    api::clear_launcher_session()
+async fn clear_launcher_session() -> Result<(), String> {
+    api::clear_launcher_session().await
 }
 
 #[tauri::command]
@@ -19,7 +19,7 @@ async fn begin_device_authorization() -> Result<api::DeviceCode, String> {
 #[tauri::command]
 async fn poll_device_authorization(
     device_code: api::DeviceCode,
-) -> Result<Option<api::LauncherSession>, String> {
+) -> Result<api::DeviceAuthorizationPoll, String> {
     api::poll_device_authorization(device_code).await
 }
 

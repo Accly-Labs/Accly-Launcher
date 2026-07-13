@@ -1,6 +1,9 @@
 @import "tailwindcss";
 
 :root {
+  --accly-primary: #6127ff;
+  --accly-primary-soft: #bba6ff;
+  --accly-success-soft: #9ee7b8;
   color: #f1f3ee;
   background: #101110;
   font-family:
@@ -42,8 +45,8 @@ select:not(:disabled) {
 }
 
 ::selection {
-  background: #b3cc72;
-  color: #101110;
+  background: var(--accly-primary);
+  color: #fff;
 }
 
 .app-shell {
@@ -109,14 +112,14 @@ select:not(:disabled) {
 }
 
 .step-item.is-current::before {
-  border-color: #b3cc72;
-  background: #b3cc72;
-  box-shadow: 0 0 0 4px rgb(179 204 114 / 0.1);
+  border-color: var(--accly-primary);
+  background: var(--accly-primary);
+  box-shadow: 0 0 0 4px rgb(97 39 255 / 0.2);
 }
 
 .step-item.is-done::before {
-  border-color: #9fb967;
-  background: #9fb967;
+  border-color: #8e6cff;
+  background: #8e6cff;
 }
 
 .rail-bottom {
@@ -167,11 +170,11 @@ select:not(:disabled) {
   min-height: 26px;
   align-items: center;
   gap: 6px;
-  border: 1px solid rgb(179 204 114 / 0.32);
+  border: 1px solid rgb(95 209 140 / 0.34);
   border-radius: 999px;
-  background: rgb(179 204 114 / 0.08);
+  background: rgb(95 209 140 / 0.08);
   padding: 0 9px;
-  color: #cce78c;
+  color: var(--accly-success-soft);
   font-size: 11px;
   font-weight: 600;
 }
@@ -257,7 +260,7 @@ select:not(:disabled) {
 
 .usage-fill {
   height: 100%;
-  background: #b3cc72;
+  background: var(--accly-primary);
   transition: width 180ms ease-out;
 }
 
@@ -353,7 +356,7 @@ select:not(:disabled) {
 }
 
 .agent-state[data-state="ready"] {
-  color: #c6df84;
+  color: var(--accly-success-soft);
 }
 
 .agent-state[data-state="broken"] {
@@ -374,9 +377,9 @@ select:not(:disabled) {
   max-width: min(380px, calc(100vw - 48px));
   align-items: center;
   gap: 9px;
-  border: 1px solid rgb(179 204 114 / 0.3);
+  border: 1px solid rgb(97 39 255 / 0.38);
   border-radius: 7px;
-  background: #20241d;
+  background: #1d1930;
   padding: 12px 14px;
   color: #e7eadf;
   font-size: 13px;
@@ -442,7 +445,7 @@ select:not(:disabled) {
 
 .device-code-value {
   margin: 10px 0 0;
-  color: #e7efbf;
+  color: var(--accly-primary-soft);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 25px;
   font-weight: 650;
@@ -491,8 +494,8 @@ select:not(:disabled) {
 }
 
 .select-field:focus {
-  border-color: #b3cc72;
-  box-shadow: 0 0 0 2px rgb(179 204 114 / 0.15);
+  border-color: var(--accly-primary);
+  box-shadow: 0 0 0 2px rgb(97 39 255 / 0.2);
 }
 
 .key-row {
@@ -532,15 +535,15 @@ select:not(:disabled) {
 }
 
 .secret-reveal {
-  border: 1px solid rgb(179 204 114 / 0.25);
-  background: rgb(179 204 114 / 0.08);
+  border: 1px solid rgb(97 39 255 / 0.32);
+  background: rgb(97 39 255 / 0.1);
   padding: 13px;
 }
 
 .secret-reveal code {
   display: block;
   overflow-x: auto;
-  color: #ddedb4;
+  color: #cabaff;
   font-size: 12px;
 }
 

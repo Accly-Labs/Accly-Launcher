@@ -9,6 +9,7 @@ import type {
   ConfigureResult,
   CreatedApiKey,
   DeviceCode,
+  DeviceAuthorizationPoll,
   LauncherSession,
 } from "./types";
 
@@ -169,7 +170,8 @@ export async function beginDeviceAuthorization(): Promise<DeviceCode> {
       deviceCode: "local-development-code",
       userCode: "ACCLY-DEV",
       verificationUri: "https://auth.accly.net/device",
-      verificationUriComplete: "https://auth.accly.net/device?code=ACCLY-DEV",
+      verificationUriComplete:
+        "https://auth.accly.net/device?user_code=ACCLY-DEV",
       expiresIn: 1800,
       interval: 2,
     };
@@ -180,13 +182,16 @@ export async function beginDeviceAuthorization(): Promise<DeviceCode> {
 
 export async function completeDeviceAuthorization(
   deviceCode: DeviceCode,
-): Promise<LauncherSession | null> {
+): Promise<DeviceAuthorizationPoll> {
   if (!isTauri()) {
     demoSession = true;
-    return { expiresAt: null };
+    return {
+      status: "completed",
+      session: { expiresAt: null },
+    };
   }
 
-  return invoke<LauncherSession | null>("poll_device_authorization", {
+  return invoke<DeviceAuthorizationPoll>("poll_device_authorization", {
     deviceCode,
   });
 }

@@ -55,10 +55,18 @@ type Notice = { tone: "success" | "error"; message: string } | null;
 const gatewayUrl =
   import.meta.env.VITE_ACCLY_GATEWAY_URL ?? "https://api.accly.net";
 
-function messageFrom(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : "Something went wrong. Try again.";
+export function messageFrom(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return error.message;
+  }
+  return "Something went wrong. Try again.";
 }
 
 async function copyToClipboard(value: string) {
@@ -138,7 +146,7 @@ function SignInScreen({
                 Open browser <ArrowUpRight size={15} />
               </Button>
               <LoaderCircle
-                className="animate-spin text-[#b3cc72]"
+                className="animate-spin text-[#8e6cff]"
                 size={18}
                 aria-label="Waiting for approval"
               />
@@ -452,7 +460,7 @@ function AgentConfigurationDialog({
             </p>
           ) : null}
           {result ? (
-            <div className="secret-reveal text-sm text-[#dce8ba]">{result}</div>
+            <div className="secret-reveal text-sm text-[#cabaff]">{result}</div>
           ) : null}
           {configureMutation.error ? (
             <p className="error-copy">{messageFrom(configureMutation.error)}</p>
@@ -460,7 +468,7 @@ function AgentConfigurationDialog({
         </div>
         <DialogFooter>
           {apiKey ? (
-            <span className="mr-auto text-xs text-[#b9c886]">
+            <span className="mr-auto text-xs text-[#ad95ff]">
               API key ready
             </span>
           ) : null}
@@ -564,8 +572,8 @@ function Launcher() {
     setLoginError(null);
     try {
       const code = await beginDeviceAuthorization();
-      setDeviceCode(code);
       await openExternal(code.verificationUriComplete ?? code.verificationUri);
+      setDeviceCode(code);
     } catch (error) {
       setLoginError(messageFrom(error));
     } finally {
@@ -580,8 +588,8 @@ function Launcher() {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       try {
-        const session = await completeDeviceAuthorization(deviceCode);
-        if (session) {
+        const result = await completeDeviceAuthorization(deviceCode);
+        if (result.status === "completed") {
           if (!cancelled) {
             setDeviceCode(null);
             await queryClient.invalidateQueries({
@@ -590,16 +598,19 @@ function Launcher() {
           }
           return;
         }
-      } catch (error) {
-        const message = messageFrom(error);
-        if (!/authorization_pending|slow_down/i.test(message)) {
-          if (!cancelled) setLoginError(message);
-          return;
-        }
-      }
 
-      if (!cancelled) {
-        timeout = setTimeout(poll, Math.max(deviceCode.interval, 2) * 1000);
+        if (!cancelled) {
+          timeout = setTimeout(
+            poll,
+            Math.max(result.retryAfterSeconds, 2) * 1000,
+          );
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setDeviceCode(null);
+          setLoginError(messageFrom(error));
+        }
+        return;
       }
     };
 
@@ -626,7 +637,7 @@ function Launcher() {
   if (sessionQuery.isPending) {
     return (
       <main className="signin-shell" aria-label="Loading Accly Launcher">
-        <LoaderCircle className="animate-spin text-[#b3cc72]" size={22} />
+        <LoaderCircle className="animate-spin text-[#8e6cff]" size={22} />
       </main>
     );
   }
@@ -645,7 +656,7 @@ function Launcher() {
   if (accountQuery.isPending || agentsQuery.isPending) {
     return (
       <main className="signin-shell" aria-label="Loading your account">
-        <LoaderCircle className="animate-spin text-[#b3cc72]" size={22} />
+        <LoaderCircle className="animate-spin text-[#8e6cff]" size={22} />
       </main>
     );
   }
@@ -763,7 +774,7 @@ function Launcher() {
             <div>
               <p className="account-label">Plan</p>
               <p className="plan-name">
-                <BadgeCheck size={19} className="text-[#b3cc72]" />{" "}
+                <BadgeCheck size={19} className="text-[#8e6cff]" />{" "}
                 {account.plan.planName}
               </p>
               <p className="plan-detail">
@@ -878,7 +889,7 @@ function Launcher() {
       {notice ? (
         <div className="notice" role="status">
           {notice.tone === "success" ? (
-            <Check size={16} className="text-[#b3cc72]" />
+            <Check size={16} className="text-[#5fd18c]" />
           ) : (
             <AlertCircle size={16} className="text-[#efad98]" />
           )}
