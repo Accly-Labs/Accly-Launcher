@@ -141,12 +141,16 @@ function SignInScreen({
               <p className="device-code-label">Verification code</p>
               <p className="device-code-value">{deviceCode.userCode}</p>
             </div>
-            <div className="signin-actions">
-              <Button variant="primary" onClick={openVerification}>
+            <div className="signin-actions signin-actions--approval">
+              <Button
+                className="signin-primary-action"
+                variant="primary"
+                onClick={openVerification}
+              >
                 Open browser <ArrowUpRight size={15} />
               </Button>
               <LoaderCircle
-                className="animate-spin text-[#8e6cff]"
+                className="signin-approval-spinner animate-spin text-[#8e6cff]"
                 size={18}
                 aria-label="Waiting for approval"
               />
@@ -155,6 +159,7 @@ function SignInScreen({
         ) : (
           <div className="signin-actions">
             <Button
+              className="signin-primary-action"
               variant="primary"
               onClick={() => void onStart()}
               disabled={starting}

@@ -402,8 +402,10 @@ select:not(:disabled) {
 }
 
 .signin-logo {
+  display: block;
   width: 112px;
   height: auto;
+  margin-inline: auto;
 }
 
 .signin-panel h1 {
@@ -426,6 +428,25 @@ select:not(:disabled) {
   align-items: center;
   gap: 10px;
   margin-top: 34px;
+}
+
+.signin-primary-action {
+  width: 100%;
+}
+
+.signin-actions--approval {
+  position: relative;
+}
+
+.signin-actions--approval .signin-primary-action {
+  padding-right: 44px;
+}
+
+.signin-approval-spinner {
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  transform: translateY(-50%);
 }
 
 .device-code {
