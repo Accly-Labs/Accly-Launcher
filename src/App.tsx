@@ -62,6 +62,14 @@ type Notice = { tone: "success" | "error"; message: string } | null;
 const ACCOUNT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AGENT_SCAN_INTERVAL_MS = 30 * 1000;
+const DEVICE_CODE_EXPIRED_MESSAGE =
+  "This verification code expired. Generate a new code to continue.";
+const SESSION_EXPIRED_MESSAGE =
+  "Your launcher session has expired. Reconnect to continue.";
+
+type PendingDeviceCode = DeviceCode & {
+  expiresAt: number;
+};
 
 const gatewayUrl =
   import.meta.env.VITE_ACCLY_GATEWAY_URL ?? "https://api.accly.net";
@@ -90,6 +98,30 @@ async function openExternal(url: string) {
     return;
   }
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function formatRemainingTime(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function useRemainingSeconds(expiresAt: number | null) {
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!expiresAt) return;
+
+    setCurrentTime(Date.now());
+    const interval = window.setInterval(
+      () => setCurrentTime(Date.now()),
+      1_000,
+    );
+    return () => window.clearInterval(interval);
+  }, [expiresAt]);
+
+  if (!expiresAt) return null;
+  return Math.max(0, Math.ceil((expiresAt - currentTime) / 1_000));
 }
 
 function AgentIcon({ agent }: { agent: AgentDetection }) {
@@ -123,17 +155,23 @@ function AgentStateIcon({ state }: { state: AgentDetection["state"] }) {
 
 function SignInScreen({
   deviceCode,
+  deviceCodeExpiresAt,
   error,
   starting,
   onStart,
   onStartOver,
 }: {
   deviceCode: DeviceCode | null;
+  deviceCodeExpiresAt: number | null;
   error: string | null;
   starting: boolean;
   onStart: () => Promise<void>;
   onStartOver: () => void;
 }) {
+  const remainingSeconds = useRemainingSeconds(deviceCodeExpiresAt);
+  const startLabel =
+    error === DEVICE_CODE_EXPIRED_MESSAGE ? "Generate new code" : "Continue";
+
   const openVerification = () => {
     if (!deviceCode) return;
     void openExternal(
@@ -153,6 +191,11 @@ function SignInScreen({
             <div className="device-code">
               <p className="device-code-label">Verification code</p>
               <p className="device-code-value">{deviceCode.userCode}</p>
+              {remainingSeconds !== null ? (
+                <p className="device-code-expiry" aria-live="polite">
+                  Expires in {formatRemainingTime(remainingSeconds)}
+                </p>
+              ) : null}
             </div>
             <div className="signin-actions signin-actions--approval">
               <Button
@@ -162,12 +205,10 @@ function SignInScreen({
               >
                 Open browser <ArrowUpRight size={15} />
               </Button>
-              <LoaderCircle
-                className="signin-approval-spinner animate-spin text-[#8e6cff]"
-                size={18}
-                aria-label="Waiting for approval"
-              />
             </div>
+            <p className="signin-approval-status" aria-live="polite">
+              <CircleDashed size={16} aria-hidden="true" /> Waiting for approval
+            </p>
             <div className="signin-reset">
               <Button variant="quiet" size="compact" onClick={onStartOver}>
                 <RotateCw size={14} /> Start over
@@ -185,12 +226,52 @@ function SignInScreen({
               {starting ? (
                 <LoaderCircle className="animate-spin" size={15} />
               ) : null}
-              Continue
+              {startLabel}
             </Button>
           </div>
         )}
 
         {error ? <p className="error-copy mt-5">{error}</p> : null}
+      </section>
+    </main>
+  );
+}
+
+function SessionBootstrap() {
+  return (
+    <main className="signin-shell" aria-label="Checking secure session">
+      <section className="signin-panel session-status" aria-live="polite">
+        <img className="signin-logo" src="/logo-white.svg" alt="Accly" />
+        <KeyRound
+          className="session-status-icon"
+          size={23}
+          aria-hidden="true"
+        />
+        <h1>Checking secure session.</h1>
+        <p>macOS may ask for Keychain access.</p>
+      </section>
+    </main>
+  );
+}
+
+function SessionReadError({
+  error,
+  onRetry,
+}: {
+  error: unknown;
+  onRetry: () => void;
+}) {
+  return (
+    <main className="signin-shell">
+      <section className="signin-panel" aria-labelledby="session-error-title">
+        <img className="signin-logo" src="/logo-white.svg" alt="Accly" />
+        <h1 id="session-error-title">Secure session unavailable.</h1>
+        <p className="error-copy">{messageFrom(error)}</p>
+        <div className="signin-actions">
+          <Button variant="secondary" onClick={onRetry}>
+            <RefreshCw size={15} /> Retry
+          </Button>
+        </div>
       </section>
     </main>
   );
@@ -567,7 +648,7 @@ function FreePlan({ onSignOut }: { onSignOut: () => Promise<void> }) {
 
 function Launcher() {
   const queryClient = useQueryClient();
-  const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
+  const [deviceCode, setDeviceCode] = useState<PendingDeviceCode | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [startingLogin, setStartingLogin] = useState(false);
   const loginInFlightRef = useRef(false);
@@ -582,6 +663,7 @@ function Launcher() {
     queryKey: ["launcher-session"],
     queryFn: getLauncherSession,
     staleTime: Infinity,
+    retry: false,
   });
   const signedIn = Boolean(sessionQuery.data);
 
@@ -645,7 +727,10 @@ function Launcher() {
     setLoginError(null);
     try {
       const code = await beginDeviceAuthorization();
-      setDeviceCode(code);
+      setDeviceCode({
+        ...code,
+        expiresAt: Date.now() + Math.max(code.expiresIn, 1) * 1_000,
+      });
       await openExternal(code.verificationUriComplete ?? code.verificationUri);
     } catch (error) {
       setDeviceCode(null);
@@ -665,8 +750,22 @@ function Launcher() {
     if (!deviceCode) return;
 
     let cancelled = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let pollTimeout: number | undefined;
+    const expireDeviceCode = () => {
+      if (cancelled) return;
+      setDeviceCode(null);
+      setLoginError(DEVICE_CODE_EXPIRED_MESSAGE);
+    };
+    const expiryTimeout = window.setTimeout(
+      expireDeviceCode,
+      Math.max(0, deviceCode.expiresAt - Date.now()),
+    );
     const poll = async () => {
+      if (Date.now() >= deviceCode.expiresAt) {
+        expireDeviceCode();
+        return;
+      }
+
       try {
         const result = await completeDeviceAuthorization(deviceCode);
         if (result.status === "completed") {
@@ -679,10 +778,22 @@ function Launcher() {
           return;
         }
 
+        if (result.status === "expired") {
+          expireDeviceCode();
+          return;
+        }
+
         if (!cancelled) {
-          timeout = setTimeout(
+          const remainingMilliseconds = Math.max(
+            1,
+            deviceCode.expiresAt - Date.now(),
+          );
+          pollTimeout = window.setTimeout(
             poll,
-            Math.max(result.retryAfterSeconds, 2) * 1000,
+            Math.min(
+              Math.max(result.retryAfterSeconds, 2) * 1_000,
+              remainingMilliseconds,
+            ),
           );
         }
       } catch (error) {
@@ -697,9 +808,36 @@ function Launcher() {
     void poll();
     return () => {
       cancelled = true;
-      if (timeout) clearTimeout(timeout);
+      window.clearTimeout(expiryTimeout);
+      if (pollTimeout) window.clearTimeout(pollTimeout);
     };
   }, [deviceCode, queryClient]);
+
+  useEffect(() => {
+    const expiresAt = Date.parse(sessionQuery.data?.expiresAt ?? "");
+    if (!Number.isFinite(expiresAt)) return;
+
+    const timeout = window.setTimeout(
+      () => {
+        setLoginError(SESSION_EXPIRED_MESSAGE);
+        void sessionQuery.refetch();
+      },
+      Math.max(0, expiresAt - Date.now()),
+    );
+
+    return () => window.clearTimeout(timeout);
+  }, [sessionQuery.data?.expiresAt, sessionQuery.refetch]);
+
+  const accountSessionExpired =
+    accountQuery.error &&
+    messageFrom(accountQuery.error) === SESSION_EXPIRED_MESSAGE;
+
+  useEffect(() => {
+    if (!accountSessionExpired) return;
+
+    setLoginError(SESSION_EXPIRED_MESSAGE);
+    void sessionQuery.refetch();
+  }, [accountSessionExpired, sessionQuery.refetch]);
 
   useEffect(() => {
     if (!notice) return;
@@ -732,10 +870,15 @@ function Launcher() {
   };
 
   if (sessionQuery.isPending) {
+    return <SessionBootstrap />;
+  }
+
+  if (sessionQuery.error) {
     return (
-      <main className="signin-shell" aria-label="Loading Accly Launcher">
-        <LoaderCircle className="animate-spin text-[#8e6cff]" size={22} />
-      </main>
+      <SessionReadError
+        error={sessionQuery.error}
+        onRetry={() => void sessionQuery.refetch()}
+      />
     );
   }
 
@@ -743,6 +886,7 @@ function Launcher() {
     return (
       <SignInScreen
         deviceCode={deviceCode}
+        deviceCodeExpiresAt={deviceCode?.expiresAt ?? null}
         error={loginError}
         starting={startingLogin}
         onStart={startLogin}
@@ -756,6 +900,19 @@ function Launcher() {
       <main className="signin-shell" aria-label="Loading your account">
         <LoaderCircle className="animate-spin text-[#8e6cff]" size={22} />
       </main>
+    );
+  }
+
+  if (accountSessionExpired) {
+    return (
+      <SignInScreen
+        deviceCode={deviceCode}
+        deviceCodeExpiresAt={deviceCode?.expiresAt ?? null}
+        error={SESSION_EXPIRED_MESSAGE}
+        starting={startingLogin}
+        onStart={startLogin}
+        onStartOver={restartLogin}
+      />
     );
   }
 

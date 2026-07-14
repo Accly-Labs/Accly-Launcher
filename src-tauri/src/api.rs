@@ -14,6 +14,8 @@ const PRODUCTION_CORE_ORIGIN: &str = "https://core.accly.net";
 const MIN_POLL_INTERVAL_SECONDS: u64 = 2;
 const SLOW_DOWN_INTERVAL_INCREMENT_SECONDS: u64 = 5;
 const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_REAUTHENTICATION_MESSAGE: &str =
+    "Your launcher session has expired. Reconnect to continue.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,7 +28,7 @@ pub struct DeviceCode {
     pub interval: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherSession {
     pub expires_at: Option<String>,
@@ -39,6 +41,7 @@ pub enum DeviceAuthorizationPoll {
         #[serde(rename = "retryAfterSeconds")]
         retry_after_seconds: u64,
     },
+    Expired,
     Completed {
         session: LauncherSession,
     },
@@ -111,6 +114,11 @@ struct DeviceCodeResponse {
 #[derive(Deserialize)]
 struct DeviceTokenResponse {
     access_token: String,
+}
+
+#[derive(Deserialize)]
+struct LauncherSessionResponse {
+    session: LauncherSession,
 }
 
 #[derive(Deserialize)]
@@ -314,7 +322,7 @@ fn is_valid_user_code(value: &str) -> bool {
 }
 
 fn default_expires_in() -> u64 {
-    1_800
+    900
 }
 
 fn default_interval() -> u64 {
@@ -359,8 +367,35 @@ fn store_session_token(token: &str) -> Result<(), String> {
         .map_err(|error| format!("Unable to store the launcher session: {error}"))
 }
 
-pub fn get_launcher_session() -> Result<Option<LauncherSession>, String> {
-    Ok(read_session_token()?.map(|_| LauncherSession { expires_at: None }))
+pub async fn get_launcher_session() -> Result<Option<LauncherSession>, String> {
+    let Some(token) = read_session_token()? else {
+        return Ok(None);
+    };
+
+    let endpoints = Endpoints::load()?;
+    let response = client()?
+        .get(endpoints.launcher_session_route())
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("Unable to verify the launcher session: {error}"))?;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        delete_session_token()?;
+        return Ok(None);
+    }
+
+    let session: LauncherSessionResponse = response_json(response).await?;
+    Ok(Some(verified_launcher_session(session)?))
+}
+
+fn verified_launcher_session(response: LauncherSessionResponse) -> Result<LauncherSession, String> {
+    let session = response.session;
+    if session.expires_at.as_deref().is_none_or(str::is_empty) {
+        return Err("Auth returned a launcher session without an expiry.".to_string());
+    }
+
+    Ok(session)
 }
 
 pub async fn clear_launcher_session() -> Result<(), String> {
@@ -368,6 +403,10 @@ pub async fn clear_launcher_session() -> Result<(), String> {
         revoke_launcher_session(&token).await;
     }
 
+    delete_session_token()
+}
+
+fn delete_session_token() -> Result<(), String> {
     let entry = session_entry()?;
     match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
@@ -450,7 +489,7 @@ pub async fn poll_device_authorization(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if let Ok(error) = serde_json::from_str::<DeviceTokenErrorResponse>(&body) {
-            if let Some(poll) = nonterminal_device_poll(&error, device_code.interval) {
+            if let Some(poll) = device_authorization_poll_result(&error, device_code.interval) {
                 return Ok(poll);
             }
 
@@ -470,21 +509,22 @@ pub async fn poll_device_authorization(
     })
 }
 
-fn nonterminal_device_poll(
+fn device_authorization_poll_result(
     error: &DeviceTokenErrorResponse,
     interval: u64,
 ) -> Option<DeviceAuthorizationPoll> {
-    let retry_after_seconds = match error.error.as_str() {
-        "authorization_pending" => interval.max(MIN_POLL_INTERVAL_SECONDS),
-        "slow_down" => interval
-            .max(MIN_POLL_INTERVAL_SECONDS)
-            .saturating_add(SLOW_DOWN_INTERVAL_INCREMENT_SECONDS),
-        _ => return None,
-    };
-
-    Some(DeviceAuthorizationPoll::Pending {
-        retry_after_seconds,
-    })
+    match error.error.as_str() {
+        "authorization_pending" => Some(DeviceAuthorizationPoll::Pending {
+            retry_after_seconds: interval.max(MIN_POLL_INTERVAL_SECONDS),
+        }),
+        "slow_down" => Some(DeviceAuthorizationPoll::Pending {
+            retry_after_seconds: interval
+                .max(MIN_POLL_INTERVAL_SECONDS)
+                .saturating_add(SLOW_DOWN_INTERVAL_INCREMENT_SECONDS),
+        }),
+        "expired_token" => Some(DeviceAuthorizationPoll::Expired),
+        _ => None,
+    }
 }
 
 fn device_token_error_message(error: &DeviceTokenErrorResponse) -> String {
@@ -633,7 +673,7 @@ async fn authorized_request(
     body: Option<Value>,
 ) -> Result<Response, String> {
     let token =
-        read_session_token()?.ok_or_else(|| "Sign in to your Accly account first.".to_string())?;
+        read_session_token()?.ok_or_else(|| SESSION_REAUTHENTICATION_MESSAGE.to_string())?;
     let endpoints = Endpoints::load()?;
     let request = client()?
         .request(method, endpoints.core_route(route))
@@ -642,10 +682,17 @@ async fn authorized_request(
         Some(body) => request.json(&body),
         None => request,
     };
-    request
+    let response = request
         .send()
         .await
-        .map_err(|error| format!("Unable to contact Accly: {error}"))
+        .map_err(|error| format!("Unable to contact Accly: {error}"))?;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        delete_session_token()?;
+        return Err(SESSION_REAUTHENTICATION_MESSAGE.to_string());
+    }
+
+    Ok(response)
 }
 
 async fn response_json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
@@ -683,9 +730,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        nonterminal_device_poll, update_checks_enabled, usage_summary, validate_build_profile,
-        validate_endpoint, validate_verification_uri, DeviceAuthorizationPoll,
-        DeviceTokenErrorResponse, Endpoints, PRODUCTION_AUTH_ORIGIN, PRODUCTION_CORE_ORIGIN,
+        device_authorization_poll_result, update_checks_enabled, usage_summary,
+        validate_build_profile, validate_endpoint, validate_verification_uri,
+        verified_launcher_session, DeviceAuthorizationPoll, DeviceTokenErrorResponse, Endpoints,
+        LauncherSessionResponse, PRODUCTION_AUTH_ORIGIN, PRODUCTION_CORE_ORIGIN,
     };
 
     #[test]
@@ -782,13 +830,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_pending_and_slow_down_device_errors() {
+    fn classifies_device_authorization_poll_responses() {
         let pending = DeviceTokenErrorResponse {
             error: "authorization_pending".to_string(),
             error_description: "Authorization pending".to_string(),
         };
         assert_eq!(
-            nonterminal_device_poll(&pending, 5),
+            device_authorization_poll_result(&pending, 5),
             Some(DeviceAuthorizationPoll::Pending {
                 retry_after_seconds: 5,
             })
@@ -799,10 +847,19 @@ mod tests {
             error_description: "Polling too frequently".to_string(),
         };
         assert_eq!(
-            nonterminal_device_poll(&slow_down, 5),
+            device_authorization_poll_result(&slow_down, 5),
             Some(DeviceAuthorizationPoll::Pending {
                 retry_after_seconds: 10,
             })
+        );
+
+        let expired = DeviceTokenErrorResponse {
+            error: "expired_token".to_string(),
+            error_description: "Device code has expired".to_string(),
+        };
+        assert_eq!(
+            device_authorization_poll_result(&expired, 5),
+            Some(DeviceAuthorizationPoll::Expired)
         );
     }
 
@@ -817,6 +874,31 @@ mod tests {
             payload,
             json!({ "status": "pending", "retryAfterSeconds": 10 })
         );
+
+        let expired = serde_json::to_value(DeviceAuthorizationPoll::Expired)
+            .expect("expired device authorization result should serialize");
+        assert_eq!(expired, json!({ "status": "expired" }));
+    }
+
+    #[test]
+    fn accepts_only_launcher_sessions_with_an_expiry() {
+        let valid: LauncherSessionResponse = serde_json::from_value(json!({
+            "session": { "expiresAt": "2026-07-21T12:00:00.000Z" }
+        }))
+        .expect("Auth session response should deserialize");
+        assert_eq!(
+            verified_launcher_session(valid)
+                .expect("expiry should be present")
+                .expires_at
+                .as_deref(),
+            Some("2026-07-21T12:00:00.000Z")
+        );
+
+        let missing: LauncherSessionResponse = serde_json::from_value(json!({
+            "session": { "expiresAt": null }
+        }))
+        .expect("missing expiry response should deserialize");
+        assert!(verified_launcher_session(missing).is_err());
     }
 
     #[test]

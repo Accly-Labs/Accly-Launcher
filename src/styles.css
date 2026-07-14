@@ -401,19 +401,15 @@ select:not(:disabled) {
   width: 100%;
 }
 
-.signin-actions--approval {
-  position: relative;
-}
-
-.signin-actions--approval .signin-primary-action {
-  padding-right: 44px;
-}
-
-.signin-approval-spinner {
-  position: absolute;
-  top: 50%;
-  right: 16px;
-  transform: translateY(-50%);
+.signin-approval-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  width: 100%;
+  margin: 10px 0 0;
+  color: rgb(255 255 255 / 0.82);
+  font-size: 12px;
 }
 
 .signin-reset {
@@ -443,6 +439,25 @@ select:not(:disabled) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 25px;
   font-weight: 650;
+}
+
+.device-code-expiry {
+  margin: 8px 0 0;
+  color: #92988f;
+  font-size: 12px;
+}
+
+.session-status {
+  text-align: center;
+}
+
+.session-status-icon {
+  margin-top: 34px;
+  color: var(--accly-primary-soft);
+}
+
+.session-status h1 {
+  margin-top: 18px;
 }
 
 .dialog-title {

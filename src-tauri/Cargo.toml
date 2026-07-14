@@ -1,6 +1,6 @@
 [package]
 name = "accly-launcher"
-version = "0.2.0"
+version = "0.2.2"
 description = "Configure supported AI agents for Accly in minutes."
 authors = ["Accly Labs"]
 edition = "2021"

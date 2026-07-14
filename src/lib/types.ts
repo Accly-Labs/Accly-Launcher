@@ -75,6 +75,9 @@ export type DeviceAuthorizationPoll =
       retryAfterSeconds: number;
     }
   | {
+      status: "expired";
+    }
+  | {
       status: "completed";
       session: LauncherSession;
     };

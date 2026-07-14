@@ -251,7 +251,7 @@ export async function beginDeviceAuthorization(): Promise<DeviceCode> {
       verificationUri: "https://auth.accly.net/device",
       verificationUriComplete:
         "https://auth.accly.net/device?user_code=ACCLY-DEV",
-      expiresIn: 1800,
+      expiresIn: 900,
       interval: 2,
     };
   }

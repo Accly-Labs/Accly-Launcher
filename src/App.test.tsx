@@ -40,7 +40,7 @@ const deviceCode = {
   userCode: "ACCLY-DEV",
   verificationUri: "https://auth.accly.net/device",
   verificationUriComplete: "https://auth.accly.net/device?user_code=ACCLY-DEV",
-  expiresIn: 1800,
+  expiresIn: 900,
   interval: 5,
 };
 
@@ -91,6 +91,59 @@ describe("Accly Launcher", () => {
     expect(messageFrom("Device authorization is unavailable.")).toBe(
       "Device authorization is unavailable.",
     );
+  });
+
+  it("shows a secure-session state while Keychain access is pending", async () => {
+    let resolveSession: ((value: null) => void) | undefined;
+    nativeMocks.getLauncherSession.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSession = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText("Checking secure session."),
+    ).toBeInTheDocument();
+    await act(async () => {
+      resolveSession!(null);
+    });
+    expect(
+      await screen.findByRole("button", { name: "Continue" }),
+    ).toBeInTheDocument();
+  });
+
+  it("lets the user retry a Keychain session read failure", async () => {
+    nativeMocks.getLauncherSession
+      .mockRejectedValueOnce(new Error("Keychain access was denied."))
+      .mockResolvedValueOnce(null);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Secure session unavailable.",
+      }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(
+      await screen.findByRole("button", { name: "Continue" }),
+    ).toBeInTheDocument();
+    expect(nativeMocks.getLauncherSession).toHaveBeenCalledTimes(2);
   });
 
   it("offers Gateway models for the Max plan tiers", () => {
@@ -147,7 +200,7 @@ describe("Accly Launcher", () => {
 
     await waitFor(() => {
       expect(nativeMocks.completeDeviceAuthorization).toHaveBeenCalledWith(
-        deviceCode,
+        expect.objectContaining(deviceCode),
       );
     });
     expect(screen.getByText("Verification code")).toBeInTheDocument();
@@ -297,6 +350,31 @@ describe("Accly Launcher", () => {
     expect(await screen.findByText("Access denied")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Continue" }),
+    ).toBeInTheDocument();
+  });
+
+  it("offers a new code after Auth reports that the device code expired", async () => {
+    nativeMocks.completeDeviceAuthorization.mockResolvedValue({
+      status: "expired",
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Continue" }));
+
+    expect(
+      await screen.findByText(
+        "This verification code expired. Generate a new code to continue.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Generate new code" }),
     ).toBeInTheDocument();
   });
 });

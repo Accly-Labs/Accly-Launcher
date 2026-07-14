@@ -542,7 +542,7 @@ impl AgentAdapter for GeminiAdapter {
         let env_path = &paths[0];
         let settings_path = &paths[1];
         let existing_env = read_text(env_path)?;
-        let endpoint = api_base_url(&configuration.endpoint)?;
+        let endpoint = gemini_base_url(&configuration.endpoint)?;
         let env = patch_env(
             &existing_env,
             &[
@@ -580,6 +580,15 @@ impl AgentAdapter for GeminiAdapter {
             if values.get(key).filter(|value| !value.is_empty()).is_none() {
                 return Err(format!("Gemini setting {key} is missing."));
             }
+        }
+        let endpoint = values
+            .get("GOOGLE_GEMINI_BASE_URL")
+            .expect("validated Gemini endpoint");
+        if gemini_base_url(endpoint)? != endpoint.as_str() {
+            return Err(
+                "Gemini base URL must not include /v1 or /v1beta. Reconfigure Gemini CLI."
+                    .to_string(),
+            );
         }
         let settings = read_json(&paths[1])?;
         if settings
@@ -1237,6 +1246,22 @@ fn api_base_url(endpoint: &str) -> Result<String, String> {
     }
 }
 
+fn gemini_base_url(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return Err("The Accly endpoint must start with http:// or https://.".to_string());
+    }
+    if endpoint.contains(char::is_whitespace) {
+        return Err("The Accly endpoint contains whitespace.".to_string());
+    }
+
+    Ok(endpoint
+        .strip_suffix("/v1beta")
+        .or_else(|| endpoint.strip_suffix("/v1"))
+        .unwrap_or(endpoint)
+        .to_string())
+}
+
 fn read_json(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
@@ -1362,7 +1387,8 @@ fn parse_env(contents: &str) -> std::collections::HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_base_url, parse_env, patch_env, AgentAdapter, AgentConfiguration, CodexAdapter,
+        api_base_url, gemini_base_url, parse_env, patch_env, AgentAdapter, AgentConfiguration,
+        CodexAdapter, GeminiAdapter,
     };
     use tempfile::tempdir;
 
@@ -1379,6 +1405,42 @@ mod tests {
         assert_eq!(
             api_base_url("http://localhost:8080").unwrap(),
             "http://localhost:8080/v1"
+        );
+    }
+
+    #[test]
+    fn strips_google_api_versions_from_gemini_base_url() {
+        assert_eq!(
+            gemini_base_url("https://api.accly.net/v1").unwrap(),
+            "https://api.accly.net"
+        );
+        assert_eq!(
+            gemini_base_url("http://localhost:8080/v1beta/").unwrap(),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn prepares_gemini_with_a_google_native_base_url() {
+        let home = tempdir().unwrap();
+        let configuration = AgentConfiguration {
+            agent_id: "gemini-cli".to_string(),
+            endpoint: "http://localhost:8080/v1".to_string(),
+            api_key: "sk-test-local-key".to_string(),
+            model: "gemini-3.5-flash".to_string(),
+        };
+
+        let writes = GeminiAdapter.prepare(&configuration, home.path()).unwrap();
+        let env = String::from_utf8(writes[0].contents.clone()).unwrap();
+        let values = parse_env(&env);
+
+        assert_eq!(
+            values.get("GOOGLE_GEMINI_BASE_URL").map(String::as_str),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(
+            values.get("GEMINI_MODEL").map(String::as_str),
+            Some("gemini-3.5-flash")
         );
     }
 

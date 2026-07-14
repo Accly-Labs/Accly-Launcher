@@ -11,7 +11,7 @@ writes, and HTTP requests.
 
 ## Release metadata
 
-The current launcher version is `0.2.0`. The npm package, Cargo package, and
+The current launcher version is `0.2.2`. The npm package, Cargo package, and
 Tauri bundle metadata are kept in sync for every release. See
 [CHANGELOG.md](CHANGELOG.md) for the shipped behavior and upgrade notes.
 
@@ -91,12 +91,49 @@ atomically, validates the result, and restores the previous configuration on
 failure. Non-strict JSON and JSONC targets are left unchanged rather than being
 rewritten with formatting or comments lost.
 
+Gemini CLI uses the native Google Generative AI protocol. Its configured base
+URL is the gateway origin without `/v1` or `/v1beta`; Gemini CLI supplies that
+API version and model route itself. The gateway accepts Gemini CLI's standard
+`X-Goog-Api-Key` header as well as the other documented Accly API-key headers.
+
+### Gemini CLI gateway contract
+
+When **Configure** is selected for Gemini CLI, the launcher writes these
+managed values to `~/.gemini/.env` and selects `gemini-api-key` authentication
+in `~/.gemini/settings.json`:
+
+```dotenv
+GOOGLE_GEMINI_BASE_URL=https://gateway.example.com
+GEMINI_API_KEY=<Accly Google-compatible API key>
+GEMINI_MODEL=<selected Gemini model>
+```
+
+`GOOGLE_GEMINI_BASE_URL` must be the gateway origin only. Do not append `/v1`
+or `/v1beta`: Gemini CLI adds its own `/v1beta/models/...:generateContent`
+route. The Accly Gateway must expose that native route and accept the standard
+`X-Goog-Api-Key` request header.
+
+Users upgrading from a launcher build that wrote a versioned base URL should
+select **Change** and then **Configure** for Gemini CLI once. The launcher
+rewrites the managed values to the native contract and creates a configuration
+backup before changing either file. After a Gateway rollout, start a new
+`gemini` process so it reads the updated environment.
+
 The device session is stored through the operating system credential store:
 macOS Keychain, Windows Credential Manager, or the Linux Secret Service. A
 gateway API key exists in renderer memory only for the time needed to configure
 the selected agent. Linux users need a Secret Service provider such as GNOME
 Keyring or KWallet running in their desktop session; the launcher does not fall
 back to plaintext token storage.
+
+Auth is the source of truth for launcher-session validity. On startup, the
+launcher verifies a stored bearer with Auth and removes it locally when Auth
+reports it expired or revoked. Launcher sessions expire after seven days. A
+running launcher schedules a fresh validation at the reported expiry, while an
+unauthorized Core response also returns the user to sign-in. Device approval
+codes expire after 15 minutes; the UI shows the remaining time, stops polling
+at expiry, and lets the user explicitly generate a new code. It never silently
+creates a new browser approval flow.
 
 ## Local development
 

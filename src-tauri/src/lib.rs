@@ -5,8 +5,8 @@ mod api;
 use tauri::Emitter;
 
 #[tauri::command]
-fn get_launcher_session() -> Result<Option<api::LauncherSession>, String> {
-    api::get_launcher_session()
+async fn get_launcher_session() -> Result<Option<api::LauncherSession>, String> {
+    api::get_launcher_session().await
 }
 
 #[tauri::command]
