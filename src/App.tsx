@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -11,6 +11,7 @@ import {
   CircleDashed,
   CircleX,
   Copy,
+  Download,
   KeyRound,
   LoaderCircle,
   LogOut,
@@ -37,20 +38,30 @@ import {
   getAccountSnapshot,
   getLauncherSession,
   listAgents,
+  listenForAgentLifecycleProgress,
+  repairAgent,
   regenerateApiKey,
   signOut,
+  installAgent,
+  updateAgent,
 } from "./lib/native";
 import type {
   AgentDetection,
+  AgentId,
+  AgentLifecycleProgress,
   ApiKeyGroup,
   ApiKeyRecord,
   CompatibleModel,
   CreatedApiKey,
   DeviceCode,
 } from "./lib/types";
-import { cn, formatDate, formatUsage } from "./lib/utils";
+import { formatDate, formatUsage } from "./lib/utils";
 
 type Notice = { tone: "success" | "error"; message: string } | null;
+
+const ACCOUNT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AGENT_SCAN_INTERVAL_MS = 30 * 1000;
 
 const gatewayUrl =
   import.meta.env.VITE_ACCLY_GATEWAY_URL ?? "https://api.accly.net";
@@ -115,11 +126,13 @@ function SignInScreen({
   error,
   starting,
   onStart,
+  onStartOver,
 }: {
   deviceCode: DeviceCode | null;
   error: string | null;
   starting: boolean;
   onStart: () => Promise<void>;
+  onStartOver: () => void;
 }) {
   const openVerification = () => {
     if (!deviceCode) return;
@@ -154,6 +167,11 @@ function SignInScreen({
                 size={18}
                 aria-label="Waiting for approval"
               />
+            </div>
+            <div className="signin-reset">
+              <Button variant="quiet" size="compact" onClick={onStartOver}>
+                <RotateCw size={14} /> Start over
+              </Button>
             </div>
           </>
         ) : (
@@ -353,7 +371,21 @@ function KeyDialog({
   );
 }
 
-function keyGroupForModel(model: CompatibleModel): ApiKeyGroup {
+export function compatibleModelsForAgent(
+  agentId: AgentId,
+  allowedTiers: readonly string[],
+): CompatibleModel[] {
+  return compatibleModels.filter(
+    (model) =>
+      model.agents.includes(agentId) && allowedTiers.includes(model.tier),
+  );
+}
+
+export function keyGroupForAgentModel(
+  agentId: AgentId,
+  model: CompatibleModel,
+): ApiKeyGroup {
+  if (agentId === "opencode") return "universal";
   if (model.protocol === "anthropic") return "anthropic";
   if (model.protocol === "google") return "google";
   if (model.protocol === "openai" || model.protocol === "responses")
@@ -376,15 +408,10 @@ function AgentConfigurationDialog({
   onConfigured: () => Promise<void>;
   onNotice: (notice: Notice) => void;
 }) {
-  const models = useMemo(
-    () =>
-      compatibleModels.filter(
-        (model) =>
-          model.agents.includes(agent?.id ?? "codex") &&
-          allowedTiers.includes(model.tier),
-      ),
-    [agent?.id, allowedTiers],
-  );
+  const models = useMemo(() => {
+    if (!agent) return [];
+    return compatibleModelsForAgent(agent.id, allowedTiers);
+  }, [agent, allowedTiers]);
   const [modelId, setModelId] = useState("");
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
@@ -484,7 +511,7 @@ function AgentConfigurationDialog({
               onClick={() =>
                 selectedModel &&
                 void keyMutation
-                  .mutateAsync(keyGroupForModel(selectedModel))
+                  .mutateAsync(keyGroupForAgentModel(agent.id, selectedModel))
                   .catch((error) =>
                     onNotice({ tone: "error", message: messageFrom(error) }),
                   )
@@ -543,9 +570,12 @@ function Launcher() {
   const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [startingLogin, setStartingLogin] = useState(false);
+  const loginInFlightRef = useRef(false);
   const [keysOpen, setKeysOpen] = useState(false);
   const [configuringAgent, setConfiguringAgent] =
     useState<AgentDetection | null>(null);
+  const [agentLifecycleProgress, setAgentLifecycleProgress] =
+    useState<AgentLifecycleProgress | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
 
   const sessionQuery = useQuery({
@@ -559,31 +589,76 @@ function Launcher() {
     queryKey: ["account"],
     queryFn: getAccountSnapshot,
     enabled: signedIn,
+    staleTime: ACCOUNT_REFRESH_INTERVAL_MS,
+    refetchInterval: ACCOUNT_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: false,
   });
   const agentsQuery = useQuery({
     queryKey: ["agents"],
     queryFn: listAgents,
     enabled: signedIn,
+    staleTime: AGENT_SCAN_INTERVAL_MS,
+    refetchInterval: AGENT_SCAN_INTERVAL_MS,
+    refetchOnReconnect: false,
+    refetchIntervalInBackground: false,
   });
   const updateQuery = useQuery({
     queryKey: ["update"],
     queryFn: checkForUpdate,
     enabled: signedIn,
-    refetchInterval: 4 * 60 * 60 * 1000,
+    staleTime: UPDATE_CHECK_INTERVAL_MS,
+    refetchInterval: UPDATE_CHECK_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+  });
+
+  const agentLifecycleMutation = useMutation({
+    mutationFn: async ({
+      agentId,
+      action,
+    }: {
+      agentId: AgentDetection["id"];
+      action: "install" | "update" | "repair";
+    }) => {
+      if (action === "install") return installAgent(agentId);
+      if (action === "repair") return repairAgent(agentId);
+      return updateAgent(agentId);
+    },
+    onMutate: (variables) => {
+      setAgentLifecycleProgress({
+        agentId: variables.agentId,
+        action: variables.action,
+        phase: "checking",
+        message: "Checking local installations.",
+      });
+    },
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({ queryKey: ["agents"] });
+      setNotice({ tone: "success", message: result.message });
+    },
   });
 
   const startLogin = useCallback(async () => {
+    if (loginInFlightRef.current) return;
+
+    loginInFlightRef.current = true;
     setStartingLogin(true);
     setLoginError(null);
     try {
       const code = await beginDeviceAuthorization();
-      await openExternal(code.verificationUriComplete ?? code.verificationUri);
       setDeviceCode(code);
+      await openExternal(code.verificationUriComplete ?? code.verificationUri);
     } catch (error) {
+      setDeviceCode(null);
       setLoginError(messageFrom(error));
     } finally {
+      loginInFlightRef.current = false;
       setStartingLogin(false);
     }
+  }, []);
+
+  const restartLogin = useCallback(() => {
+    setDeviceCode(null);
+    setLoginError(null);
   }, []);
 
   useEffect(() => {
@@ -632,6 +707,23 @@ function Launcher() {
     return () => clearTimeout(timeout);
   }, [notice]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    void listenForAgentLifecycleProgress((progress) => {
+      if (!disposed) setAgentLifecycleProgress(progress);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
   const handleSignOut = async () => {
     await signOut();
     setDeviceCode(null);
@@ -654,6 +746,7 @@ function Launcher() {
         error={loginError}
         starting={startingLogin}
         onStart={startLogin}
+        onStartOver={restartLogin}
       />
     );
   }
@@ -698,40 +791,22 @@ function Launcher() {
   const configuredCount = agents.filter(
     (agent) => agent.state === "ready",
   ).length;
+  const detectedCount = agents.filter((agent) => agent.installed).length;
   const usageWidth = Math.min(100, Math.max(0, account.usage.percentUsed));
 
   return (
     <div className="app-shell">
-      <aside className="rail">
-        <div className="brand">
-          <img className="brand-mark" src="/accly-icon.svg" alt="" />
-          <span>Accly Launcher</span>
-        </div>
-        <nav className="step-list" aria-label="Setup progress">
-          <span className="step-item is-done">Account</span>
-          <span
-            className={cn(
-              "step-item",
-              configuredCount ? "is-done" : "is-current",
-            )}
-          >
-            Agents
-          </span>
-          <span
-            className={cn("step-item", configuredCount ? "is-current" : "")}
-          >
-            Ready
-          </span>
-        </nav>
-        <div className="rail-bottom">
-          <p className="rail-note">macOS · English</p>
-        </div>
-      </aside>
-
       <main className="workspace">
         <div className="workspace-inner">
           <header className="topbar">
-            <p className="eyebrow">Workspace</p>
+            <div className="workspace-brand">
+              <img
+                className="workspace-brand-mark"
+                src="/accly-icon.svg"
+                alt=""
+              />
+              <span>Accly Launcher</span>
+            </div>
             <div className="topbar-actions">
               {updateQuery.data?.available && updateQuery.data.url ? (
                 <Button
@@ -812,14 +887,15 @@ function Launcher() {
           <section className="agent-section" aria-labelledby="agents-title">
             <div className="section-heading">
               <div>
-                <h2 id="agents-title">Detected agents</h2>
+                <h2 id="agents-title">Agents</h2>
                 <p>
-                  {configuredCount} of {agents.length} ready
+                  {configuredCount} connected, {detectedCount} detected
                 </p>
               </div>
               <Button
                 size="compact"
                 variant="quiet"
+                disabled={agentLifecycleMutation.isPending}
                 onClick={() => void agentsQuery.refetch()}
               >
                 <RefreshCw size={14} /> Scan again
@@ -835,23 +911,137 @@ function Launcher() {
                       <p className="agent-path">
                         {agent.configPath ?? "No configuration target"}
                       </p>
+                      {agent.version || agent.installSource ? (
+                        <p className="agent-meta">
+                          {agent.version
+                            ? `Version ${agent.version}`
+                            : "Installed"}
+                          {agent.installSource
+                            ? ` · ${agent.installSource}`
+                            : ""}
+                          {agent.installationCount > 1
+                            ? ` · ${agent.installationCount} installs found`
+                            : ""}
+                        </p>
+                      ) : null}
                     </div>
                   </div>
                   <div className="agent-state" data-state={agent.state}>
                     <AgentStateIcon state={agent.state} />
                     <span>{agent.detail}</span>
                   </div>
-                  <div className="agent-action">
-                    {agent.installed && agent.configurable ? (
+                  <div
+                    className="agent-action"
+                    aria-live={
+                      agentLifecycleMutation.isPending &&
+                      agentLifecycleMutation.variables?.agentId === agent.id
+                        ? "polite"
+                        : "off"
+                    }
+                  >
+                    {agentLifecycleMutation.isPending &&
+                    agentLifecycleMutation.variables?.agentId === agent.id ? (
+                      <div className="agent-action-progress">
+                        <Button
+                          size="compact"
+                          variant="secondary"
+                          disabled
+                          title={agentLifecycleProgress?.message}
+                        >
+                          <LoaderCircle className="animate-spin" size={15} />
+                          {agentLifecycleProgress?.phase === "checking"
+                            ? "Checking"
+                            : agentLifecycleMutation.variables.action ===
+                                "install"
+                              ? "Installing"
+                              : agentLifecycleMutation.variables.action ===
+                                  "repair"
+                                ? "Repairing"
+                                : "Updating"}
+                        </Button>
+                        <p className="agent-progress-copy">
+                          {agentLifecycleProgress?.message ?? "Working..."}
+                        </p>
+                      </div>
+                    ) : agent.canInstall ? (
                       <Button
                         size="compact"
-                        variant={
-                          agent.state === "ready" ? "secondary" : "primary"
+                        variant="primary"
+                        disabled={agentLifecycleMutation.isPending}
+                        onClick={() =>
+                          void agentLifecycleMutation
+                            .mutateAsync({
+                              agentId: agent.id,
+                              action: "install",
+                            })
+                            .catch((error) =>
+                              setNotice({
+                                tone: "error",
+                                message: messageFrom(error),
+                              }),
+                            )
                         }
-                        onClick={() => setConfiguringAgent(agent)}
                       >
-                        {agent.state === "ready" ? "Change" : "Configure"}
+                        <Download size={15} /> Install
                       </Button>
+                    ) : agent.canRepair ? (
+                      <Button
+                        size="compact"
+                        variant="primary"
+                        disabled={agentLifecycleMutation.isPending}
+                        onClick={() =>
+                          void agentLifecycleMutation
+                            .mutateAsync({
+                              agentId: agent.id,
+                              action: "repair",
+                            })
+                            .catch((error) =>
+                              setNotice({
+                                tone: "error",
+                                message: messageFrom(error),
+                              }),
+                            )
+                        }
+                      >
+                        <RotateCw size={15} /> Repair
+                      </Button>
+                    ) : agent.installed && agent.configurable ? (
+                      <div className="agent-action-buttons">
+                        {agent.canUpdate ? (
+                          <Button
+                            size="icon"
+                            variant="quiet"
+                            disabled={agentLifecycleMutation.isPending}
+                            title={`Update ${agent.name}`}
+                            aria-label={`Update ${agent.name}`}
+                            onClick={() =>
+                              void agentLifecycleMutation
+                                .mutateAsync({
+                                  agentId: agent.id,
+                                  action: "update",
+                                })
+                                .catch((error) =>
+                                  setNotice({
+                                    tone: "error",
+                                    message: messageFrom(error),
+                                  }),
+                                )
+                            }
+                          >
+                            <RotateCw size={15} />
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="compact"
+                          variant={
+                            agent.state === "ready" ? "secondary" : "primary"
+                          }
+                          disabled={agentLifecycleMutation.isPending}
+                          onClick={() => setConfiguringAgent(agent)}
+                        >
+                          {agent.state === "ready" ? "Change" : "Configure"}
+                        </Button>
+                      </div>
                     ) : (
                       <span className="text-xs text-[#6f746c]">
                         {agent.installed ? "Unavailable" : "Not installed"}

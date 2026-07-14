@@ -1,10 +1,13 @@
+use crate::agent_runtime::{
+    inspect_command, install_package, package_manager_search_paths, update_package, CommandReport,
+    HostPlatform,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -29,6 +32,13 @@ pub struct AgentDetection {
     pub config_path: Option<String>,
     pub detail: String,
     pub icon: String,
+    pub version: Option<String>,
+    pub install_source: Option<String>,
+    pub executable_path: Option<String>,
+    pub installation_count: usize,
+    pub can_install: bool,
+    pub can_update: bool,
+    pub can_repair: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +47,23 @@ pub struct ConfigureResult {
     pub agent_id: String,
     pub config_path: String,
     pub backup_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLifecycleResult {
+    pub agent: AgentDetection,
+    pub action: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLifecycleProgress {
+    pub agent_id: String,
+    pub action: String,
+    pub phase: String,
     pub message: String,
 }
 
@@ -195,6 +222,9 @@ trait AgentAdapter {
     fn app_paths(&self, _home: &Path) -> Vec<PathBuf> {
         Vec::new()
     }
+    fn package_name(&self) -> Option<&'static str> {
+        None
+    }
     fn configurable(&self) -> bool {
         true
     }
@@ -215,35 +245,53 @@ trait AgentAdapter {
             .expect("agent adapters must declare at least one configuration path")
     }
 
-    fn installed(&self, home: &Path) -> (bool, bool) {
-        let command_status = self.command().map(command_status);
-        let app_found = self.app_paths(home).iter().any(|path| path.exists());
-        let config_found = self.config_paths(home).iter().any(|path| path.exists());
-
-        match command_status {
-            Some(CommandStatus::Ready) => (true, false),
-            Some(CommandStatus::Broken) => (true, true),
-            Some(CommandStatus::Missing) => (app_found || config_found, false),
-            None => (app_found || config_found, false),
-        }
+    fn command_report(&self, home: &Path, extra_search_paths: &[PathBuf]) -> CommandReport {
+        self.command()
+            .map(|command| inspect_command(command, home, extra_search_paths))
+            .unwrap_or_default()
     }
 
-    fn detection(&self, home: &Path) -> AgentDetection {
+    fn detection(&self, home: &Path, extra_search_paths: &[PathBuf]) -> AgentDetection {
+        let report = self.command_report(home, extra_search_paths);
+        let primary_installation = report.primary();
+        let app_found = self.app_paths(home).iter().any(|path| path.exists());
+        let config_found = self.config_paths(home).iter().any(|path| path.exists());
         let primary_path = self.primary_path(home);
-        let (installed, broken) = self.installed(home);
+        let installed = primary_installation.is_some() || app_found;
+        let broken = primary_installation.is_some_and(|installation| !installation.runnable);
         let configurable = self.configurable();
         let (state, detail) = if !configurable {
             (
                 "unsupported".to_string(),
                 "No safe gateway config detected".to_string(),
             )
+        } else if report.has_conflict() {
+            (
+                "installed".to_string(),
+                format!(
+                    "{} installations detected; update manually",
+                    report.installs.len()
+                ),
+            )
         } else if broken {
             (
                 "broken".to_string(),
-                "Installed, but unavailable".to_string(),
+                primary_installation
+                    .and_then(|installation| installation.detail.as_deref())
+                    .map(compact_command_error)
+                    .filter(|detail| !detail.is_empty())
+                    .map(|detail| format!("Installed, but unavailable: {detail}"))
+                    .unwrap_or_else(|| "Installed, but unavailable".to_string()),
             )
         } else if !installed {
-            ("missing".to_string(), "Not installed".to_string())
+            (
+                "missing".to_string(),
+                if config_found {
+                    "Configuration found, CLI not installed".to_string()
+                } else {
+                    "Not installed".to_string()
+                },
+            )
         } else if self.validate(home).is_ok() {
             ("ready".to_string(), "Ready to connect".to_string())
         } else {
@@ -259,22 +307,20 @@ trait AgentAdapter {
             config_path: Some(display_path(&primary_path, home)),
             detail,
             icon: self.icon().to_string(),
+            version: primary_installation.and_then(|installation| installation.version.clone()),
+            install_source: primary_installation
+                .map(|installation| installation.source.label().to_string()),
+            executable_path: primary_installation
+                .map(|installation| display_path(&installation.path, home)),
+            installation_count: report.installs.len(),
+            can_install: configurable
+                && self.package_name().is_some()
+                && primary_installation.is_none(),
+            can_update: !report.has_conflict()
+                && primary_installation.is_some_and(|installation| installation.can_update()),
+            can_repair: !report.has_conflict()
+                && primary_installation.is_some_and(|installation| installation.can_repair()),
         }
-    }
-}
-
-enum CommandStatus {
-    Ready,
-    Broken,
-    Missing,
-}
-
-fn command_status(command: &str) -> CommandStatus {
-    match Command::new(command).arg("--version").output() {
-        Ok(output) if output.status.success() => CommandStatus::Ready,
-        Ok(_) => CommandStatus::Broken,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CommandStatus::Missing,
-        Err(_) => CommandStatus::Broken,
     }
 }
 
@@ -300,6 +346,10 @@ impl AgentAdapter for CodexAdapter {
 
     fn command(&self) -> Option<&'static str> {
         Some("codex")
+    }
+
+    fn package_name(&self) -> Option<&'static str> {
+        Some("@openai/codex")
     }
 
     fn prepare(
@@ -398,6 +448,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
         Some("claude")
     }
 
+    fn package_name(&self) -> Option<&'static str> {
+        Some("@anthropic-ai/claude-code")
+    }
+
     fn prepare(
         &self,
         configuration: &AgentConfiguration,
@@ -473,6 +527,10 @@ impl AgentAdapter for GeminiAdapter {
 
     fn command(&self) -> Option<&'static str> {
         Some("gemini")
+    }
+
+    fn package_name(&self) -> Option<&'static str> {
+        Some("@google/gemini-cli")
     }
 
     fn prepare(
@@ -551,11 +609,15 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 
     fn config_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![home.join(".config").join("opencode").join("opencode.json")]
+        vec![opencode_config_directory(home).join("opencode.json")]
     }
 
     fn command(&self) -> Option<&'static str> {
         Some("opencode")
+    }
+
+    fn package_name(&self) -> Option<&'static str> {
+        Some("opencode-ai")
     }
 
     fn prepare(
@@ -630,12 +692,7 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn config_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
-            .join("settings.json")]
+        vec![editor_settings_path(home, "Cursor")]
     }
 
     fn command(&self) -> Option<&'static str> {
@@ -643,10 +700,7 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn app_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join("Applications").join("Cursor.app"),
-            PathBuf::from("/Applications/Cursor.app"),
-        ]
+        editor_app_paths(home, "Cursor", "cursor")
     }
 
     fn configurable(&self) -> bool {
@@ -678,12 +732,7 @@ impl AgentAdapter for WindsurfAdapter {
     }
 
     fn config_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![home
-            .join("Library")
-            .join("Application Support")
-            .join("Windsurf")
-            .join("User")
-            .join("settings.json")]
+        vec![editor_settings_path(home, "Windsurf")]
     }
 
     fn command(&self) -> Option<&'static str> {
@@ -691,10 +740,7 @@ impl AgentAdapter for WindsurfAdapter {
     }
 
     fn app_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join("Applications").join("Windsurf.app"),
-            PathBuf::from("/Applications/Windsurf.app"),
-        ]
+        editor_app_paths(home, "Windsurf", "windsurf")
     }
 
     fn configurable(&self) -> bool {
@@ -732,8 +778,221 @@ pub fn detect_agents() -> Result<Vec<AgentDetection>, String> {
     let home = home_directory()?;
     Ok(adapters()
         .iter()
-        .map(|adapter| adapter.detection(&home))
+        .map(|adapter| adapter.detection(&home, &[]))
         .collect())
+}
+
+pub fn install_agent_with_progress(
+    agent_id: String,
+    on_progress: impl Fn(AgentLifecycleProgress),
+) -> Result<AgentLifecycleResult, String> {
+    run_agent_lifecycle(&agent_id, AgentLifecycleAction::Install, &on_progress)
+}
+
+pub fn update_agent_with_progress(
+    agent_id: String,
+    on_progress: impl Fn(AgentLifecycleProgress),
+) -> Result<AgentLifecycleResult, String> {
+    run_agent_lifecycle(&agent_id, AgentLifecycleAction::Update, &on_progress)
+}
+
+pub fn repair_agent_with_progress(
+    agent_id: String,
+    on_progress: impl Fn(AgentLifecycleProgress),
+) -> Result<AgentLifecycleResult, String> {
+    run_agent_lifecycle(&agent_id, AgentLifecycleAction::Repair, &on_progress)
+}
+
+#[derive(Clone, Copy)]
+enum AgentLifecycleAction {
+    Install,
+    Update,
+    Repair,
+}
+
+impl AgentLifecycleAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Repair => "repair",
+        }
+    }
+
+    fn completed_label(self) -> &'static str {
+        match self {
+            Self::Install => "installed",
+            Self::Update => "updated",
+            Self::Repair => "repaired",
+        }
+    }
+}
+
+fn run_agent_lifecycle<F>(
+    agent_id: &str,
+    action: AgentLifecycleAction,
+    on_progress: &F,
+) -> Result<AgentLifecycleResult, String>
+where
+    F: Fn(AgentLifecycleProgress),
+{
+    report_lifecycle_progress(
+        on_progress,
+        agent_id,
+        action,
+        "checking",
+        "Checking local installations.",
+    );
+
+    let result = (|| -> Result<AgentLifecycleResult, String> {
+        let home = home_directory()?;
+        let adapter = adapter_by_id(agent_id)
+            .ok_or_else(|| "This agent is not supported by Accly Launcher.".to_string())?;
+        if !adapter.configurable() {
+            return Err(format!(
+                "{} does not expose a verified custom-gateway configuration contract.",
+                adapter.name()
+            ));
+        }
+        let package = adapter
+            .package_name()
+            .ok_or_else(|| format!("{} cannot be installed by Accly Launcher.", adapter.name()))?;
+        let report = adapter.command_report(&home, &[]);
+
+        let package_manager = match action {
+            AgentLifecycleAction::Install => {
+                if report.primary().is_some() {
+                    return Err(format!(
+                        "{} is already installed. Scan again or configure it instead.",
+                        adapter.name()
+                    ));
+                }
+                report_lifecycle_progress(
+                    on_progress,
+                    agent_id,
+                    action,
+                    "installing",
+                    "Installing the supported package.",
+                );
+                install_package(package, &home)?
+            }
+            AgentLifecycleAction::Update => {
+                if report.has_conflict() {
+                    return Err(format!(
+                    "{} has {} installations. Update the intended copy with its original package manager, then scan again.",
+                    adapter.name(),
+                    report.installs.len()
+                ));
+                }
+                let installation = report.primary().ok_or_else(|| {
+                    format!(
+                        "{} is not installed. Install it before updating.",
+                        adapter.name()
+                    )
+                })?;
+                report_lifecycle_progress(
+                    on_progress,
+                    agent_id,
+                    action,
+                    "updating",
+                    "Updating with the detected package manager.",
+                );
+                update_package(package, installation, &home)?
+            }
+            AgentLifecycleAction::Repair => {
+                if report.has_conflict() {
+                    return Err(format!(
+                        "{} has {} installations. Repair the intended copy with its original package manager, then scan again.",
+                        adapter.name(),
+                        report.installs.len()
+                    ));
+                }
+                let installation = report.primary().ok_or_else(|| {
+                    format!(
+                        "{} is not installed. Install it before repairing.",
+                        adapter.name()
+                    )
+                })?;
+                if installation.runnable {
+                    return Err(format!("{} does not need repair.", adapter.name()));
+                }
+                if !installation.can_repair() {
+                    return Err(format!(
+                        "{} is managed by {}. Repair it with its original installer, then scan again.",
+                        adapter.name(),
+                        installation.source.label()
+                    ));
+                }
+                report_lifecycle_progress(
+                    on_progress,
+                    agent_id,
+                    action,
+                    "repairing",
+                    "Repairing with the detected package manager.",
+                );
+                update_package(package, installation, &home)?
+            }
+        };
+
+        report_lifecycle_progress(
+            on_progress,
+            agent_id,
+            action,
+            "scanning",
+            "Validating the installation.",
+        );
+        let extra_search_paths = package_manager_search_paths(&package_manager);
+        let agent = adapter.detection(&home, &extra_search_paths);
+        if !agent.installed {
+            return Err(format!(
+            "{} finished, but {} was not found. Restart Accly Launcher after confirming the package manager's global bin directory is on PATH.",
+            action.label(),
+            adapter.name()
+        ));
+        }
+
+        Ok(AgentLifecycleResult {
+            message: format!(
+                "{} was {}. Scan results were refreshed.",
+                adapter.name(),
+                action.completed_label()
+            ),
+            action: action.label().to_string(),
+            agent,
+        })
+    })();
+
+    match &result {
+        Ok(result) => {
+            report_lifecycle_progress(on_progress, agent_id, action, "completed", &result.message)
+        }
+        Err(_) => report_lifecycle_progress(
+            on_progress,
+            agent_id,
+            action,
+            "failed",
+            "The agent action failed. Review the displayed error and try again.",
+        ),
+    }
+
+    result
+}
+
+fn report_lifecycle_progress<F>(
+    on_progress: &F,
+    agent_id: &str,
+    action: AgentLifecycleAction,
+    phase: &str,
+    message: &str,
+) where
+    F: Fn(AgentLifecycleProgress),
+{
+    on_progress(AgentLifecycleProgress {
+        agent_id: agent_id.to_string(),
+        action: action.label().to_string(),
+        phase: phase.to_string(),
+        message: message.to_string(),
+    });
 }
 
 pub fn configure_agent(configuration: AgentConfiguration) -> Result<ConfigureResult, String> {
@@ -792,6 +1051,86 @@ fn home_directory() -> Result<PathBuf, String> {
     dirs::home_dir().ok_or_else(|| "Unable to determine the home directory.".to_string())
 }
 
+fn opencode_config_directory(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("opencode")
+}
+
+fn editor_settings_path(home: &Path, application: &str) -> PathBuf {
+    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+    let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    editor_settings_path_for(
+        HostPlatform::current(),
+        home,
+        application,
+        app_data.as_deref(),
+        config_home.as_deref(),
+    )
+}
+
+fn editor_settings_path_for(
+    platform: HostPlatform,
+    home: &Path,
+    application: &str,
+    app_data: Option<&Path>,
+    config_home: Option<&Path>,
+) -> PathBuf {
+    match platform {
+        HostPlatform::Macos => home
+            .join("Library")
+            .join("Application Support")
+            .join(application)
+            .join("User")
+            .join("settings.json"),
+        HostPlatform::Windows => app_data
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join("AppData/Roaming"))
+            .join(application)
+            .join("User")
+            .join("settings.json"),
+        HostPlatform::Linux | HostPlatform::Other => config_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".config"))
+            .join(application)
+            .join("User")
+            .join("settings.json"),
+    }
+}
+
+fn editor_app_paths(home: &Path, application: &str, executable: &str) -> Vec<PathBuf> {
+    match HostPlatform::current() {
+        HostPlatform::Macos => vec![
+            home.join("Applications").join(format!("{application}.app")),
+            PathBuf::from("/Applications").join(format!("{application}.app")),
+        ],
+        HostPlatform::Windows => {
+            let local_app_data = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData/Local"));
+            let program_files = std::env::var_os("ProgramFiles")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+            vec![
+                local_app_data
+                    .join("Programs")
+                    .join(application.to_ascii_lowercase())
+                    .join(format!("{application}.exe")),
+                program_files
+                    .join(application)
+                    .join(format!("{application}.exe")),
+            ]
+        }
+        HostPlatform::Linux | HostPlatform::Other => vec![
+            home.join(".local/bin").join(executable),
+            home.join(".local/share").join(executable).join(executable),
+            PathBuf::from("/usr/bin").join(executable),
+        ],
+    }
+}
+
 fn backup_directory(agent_id: &str) -> Result<PathBuf, String> {
     let base = dirs::data_dir().unwrap_or(home_directory()?);
     let timestamp = SystemTime::now()
@@ -809,6 +1148,18 @@ fn display_path(path: &Path, home: &Path) -> String {
     path.strip_prefix(home)
         .map(|relative| format!("~/{}", relative.display()))
         .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn compact_command_error(detail: &str) -> String {
+    let first_line = detail
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let mut compact = first_line.trim().chars().take(140).collect::<String>();
+    if first_line.trim().chars().count() > compact.chars().count() {
+        compact.push_str("...");
+    }
+    compact
 }
 
 fn atomic_write(
@@ -1010,7 +1361,10 @@ fn parse_env(contents: &str) -> std::collections::HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_base_url, parse_env, patch_env};
+    use super::{
+        api_base_url, parse_env, patch_env, AgentAdapter, AgentConfiguration, CodexAdapter,
+    };
+    use tempfile::tempdir;
 
     #[test]
     fn appends_v1_to_gateway_base_url() {
@@ -1018,6 +1372,31 @@ mod tests {
             api_base_url("https://api.accly.net").unwrap(),
             "https://api.accly.net/v1"
         );
+    }
+
+    #[test]
+    fn appends_v1_to_local_gateway_base_url() {
+        assert_eq!(
+            api_base_url("http://localhost:8080").unwrap(),
+            "http://localhost:8080/v1"
+        );
+    }
+
+    #[test]
+    fn prepares_codex_for_the_local_gateway() {
+        let home = tempdir().unwrap();
+        let configuration = AgentConfiguration {
+            agent_id: "codex".to_string(),
+            endpoint: "http://localhost:8080".to_string(),
+            api_key: "test-local-key".to_string(),
+            model: "gpt-5-4".to_string(),
+        };
+
+        let writes = CodexAdapter.prepare(&configuration, home.path()).unwrap();
+        let config = String::from_utf8(writes[0].contents.clone()).unwrap();
+
+        assert!(config.contains("base_url = \"http://localhost:8080/v1\""));
+        assert!(config.contains("model = \"gpt-5-4\""));
     }
 
     #[test]

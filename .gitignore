@@ -1,6 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target-local/
+src-tauri/tauri.local.conf.json
+scripts/build-local-dmg.sh
 cc-switch-main/
 START-HERE.md
 .env

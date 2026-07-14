@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const KEYCHAIN_SERVICE: &str = "net.accly.launcher";
+const PRODUCTION_KEYCHAIN_SERVICE: &str = "net.accly.launcher";
+const LOCAL_KEYCHAIN_SERVICE: &str = "net.accly.launcher.local";
 const KEYCHAIN_ACCOUNT: &str = "device-session";
 const PRODUCTION_AUTH_ORIGIN: &str = "https://auth.accly.net";
 const PRODUCTION_CORE_ORIGIN: &str = "https://core.accly.net";
@@ -146,27 +147,38 @@ struct Endpoints {
 
 impl Endpoints {
     fn load() -> Result<Self, String> {
-        Ok(Self {
-            auth: validate_endpoint(
+        validate_build_profile(cfg!(debug_assertions), is_local_build())?;
+        let allow_localhost = is_local_build();
+        let auth = validate_endpoint(
+            "ACCLY_AUTH_URL",
+            &configured_value(
                 "ACCLY_AUTH_URL",
-                &configured_value(
-                    "ACCLY_AUTH_URL",
-                    option_env!("ACCLY_AUTH_URL"),
-                    PRODUCTION_AUTH_ORIGIN,
-                ),
+                option_env!("ACCLY_AUTH_URL"),
                 PRODUCTION_AUTH_ORIGIN,
-                cfg!(debug_assertions),
-            )?,
-            core: validate_endpoint(
+            ),
+            PRODUCTION_AUTH_ORIGIN,
+            allow_localhost,
+        )?;
+        let core = validate_endpoint(
+            "ACCLY_CORE_URL",
+            &configured_value(
                 "ACCLY_CORE_URL",
-                &configured_value(
-                    "ACCLY_CORE_URL",
-                    option_env!("ACCLY_CORE_URL"),
-                    PRODUCTION_CORE_ORIGIN,
-                ),
+                option_env!("ACCLY_CORE_URL"),
                 PRODUCTION_CORE_ORIGIN,
-                cfg!(debug_assertions),
-            )?,
+            ),
+            PRODUCTION_CORE_ORIGIN,
+            allow_localhost,
+        )?;
+
+        if allow_localhost && (!is_localhost_endpoint(&auth) || !is_localhost_endpoint(&core)) {
+            return Err(
+                "The local launcher profile requires localhost Auth and Core URLs.".to_string(),
+            );
+        }
+
+        Ok(Self {
+            auth,
+            core,
             client_id: configured_value(
                 "ACCLY_LAUNCHER_CLIENT_ID",
                 option_env!("ACCLY_LAUNCHER_CLIENT_ID"),
@@ -185,6 +197,23 @@ impl Endpoints {
 
     fn launcher_session_route(&self) -> String {
         self.auth_route("/api/auth/launcher/session")
+    }
+}
+
+pub fn is_local_build() -> bool {
+    cfg!(feature = "local")
+}
+
+fn validate_build_profile(is_debug_build: bool, is_local_build: bool) -> Result<(), String> {
+    match (is_debug_build, is_local_build) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err(
+            "Use the local launcher profile for native debug builds so they cannot access production services."
+                .to_string(),
+        ),
+        (false, true) => Err(
+            "The local launcher profile may only be built in debug mode.".to_string(),
+        ),
     }
 }
 
@@ -237,6 +266,12 @@ fn is_localhost_url(url: &Url) -> bool {
             url.host_str(),
             Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
         )
+}
+
+fn is_localhost_endpoint(value: &str) -> bool {
+    Url::parse(value)
+        .map(|url| is_localhost_url(&url))
+        .unwrap_or(false)
 }
 
 fn validate_verification_uri(
@@ -294,8 +329,16 @@ fn client() -> Result<Client, String> {
 }
 
 fn session_entry() -> Result<Entry, String> {
-    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|error| format!("Unable to access the macOS Keychain: {error}"))
+    Entry::new(keychain_service(), KEYCHAIN_ACCOUNT)
+        .map_err(|error| format!("Unable to access the system credential store: {error}"))
+}
+
+fn keychain_service() -> &'static str {
+    if is_local_build() || cfg!(debug_assertions) {
+        LOCAL_KEYCHAIN_SERVICE
+    } else {
+        PRODUCTION_KEYCHAIN_SERVICE
+    }
 }
 
 fn read_session_token() -> Result<Option<String>, String> {
@@ -305,7 +348,7 @@ fn read_session_token() -> Result<Option<String>, String> {
         Ok(_) => Ok(None),
         Err(KeyringError::NoEntry) => Ok(None),
         Err(error) => Err(format!(
-            "Unable to read the launcher session from macOS Keychain: {error}"
+            "Unable to read the launcher session from the system credential store: {error}"
         )),
     }
 }
@@ -329,7 +372,7 @@ pub async fn clear_launcher_session() -> Result<(), String> {
     match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
         Err(error) => Err(format!(
-            "Unable to remove the launcher session from macOS Keychain: {error}"
+            "Unable to remove the launcher session from the system credential store: {error}"
         )),
     }
 }
@@ -480,14 +523,20 @@ pub async fn get_account_snapshot() -> Result<AccountSnapshot, String> {
             suspended,
             allowed_tiers,
         },
-        usage: UsageSummary {
-            daily: number_at(usage, "daily"),
-            used: number_at(usage, "used"),
-            remaining: number_at(usage, "remaining"),
-            percent_used: number_at(usage, "percentUsed"),
-        },
+        usage: usage_summary(usage),
         keys: parse_key_list(keys)?,
     })
+}
+
+fn usage_summary(usage: &Value) -> UsageSummary {
+    let request_units = usage.get("requestUnits").unwrap_or(usage);
+
+    UsageSummary {
+        daily: number_at(request_units, "daily"),
+        used: number_at(request_units, "used"),
+        remaining: number_at(request_units, "remaining"),
+        percent_used: number_at(request_units, "percentUsed"),
+    }
 }
 
 pub async fn create_api_key(group_type: String) -> Result<CreatedApiKey, String> {
@@ -522,6 +571,14 @@ pub async fn regenerate_api_key(prefix: String) -> Result<CreatedApiKey, String>
 }
 
 pub async fn check_for_update() -> Result<UpdateStatus, String> {
+    if !update_checks_enabled(is_local_build()) {
+        return Ok(UpdateStatus {
+            available: false,
+            version: None,
+            url: None,
+        });
+    }
+
     let response = client()?
         .get("https://api.github.com/repos/Accly-Labs/Accly-Launcher/releases/latest")
         .send()
@@ -545,6 +602,10 @@ pub async fn check_for_update() -> Result<UpdateStatus, String> {
         version: available.then(|| version.to_string()),
         url: available.then_some(release.html_url),
     })
+}
+
+fn update_checks_enabled(is_local_build: bool) -> bool {
+    !is_local_build
 }
 
 async fn authorized_json(
@@ -604,7 +665,7 @@ async fn response_error(response: Response) -> String {
 }
 
 fn response_error_from_body(status: StatusCode, body: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(message) = value
             .get("error_description")
             .or_else(|| value.get("message"))
@@ -622,9 +683,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        nonterminal_device_poll, validate_endpoint, validate_verification_uri,
-        DeviceAuthorizationPoll, DeviceTokenErrorResponse, Endpoints, PRODUCTION_AUTH_ORIGIN,
-        PRODUCTION_CORE_ORIGIN,
+        nonterminal_device_poll, update_checks_enabled, usage_summary, validate_build_profile,
+        validate_endpoint, validate_verification_uri, DeviceAuthorizationPoll,
+        DeviceTokenErrorResponse, Endpoints, PRODUCTION_AUTH_ORIGIN, PRODUCTION_CORE_ORIGIN,
     };
 
     #[test]
@@ -647,6 +708,20 @@ mod tests {
             ),
             Ok("http://localhost:4100".to_string())
         );
+    }
+
+    #[test]
+    fn requires_the_local_feature_for_debug_builds() {
+        assert!(validate_build_profile(true, true).is_ok());
+        assert!(validate_build_profile(false, false).is_ok());
+        assert!(validate_build_profile(true, false).is_err());
+        assert!(validate_build_profile(false, true).is_err());
+    }
+
+    #[test]
+    fn skips_github_update_checks_for_the_local_profile() {
+        assert!(!update_checks_enabled(true));
+        assert!(update_checks_enabled(false));
     }
 
     #[test]
@@ -742,6 +817,27 @@ mod tests {
             payload,
             json!({ "status": "pending", "retryAfterSeconds": 10 })
         );
+    }
+
+    #[test]
+    fn reads_request_units_from_the_core_usage_response() {
+        let usage = json!({
+            "date": "2026-07-13",
+            "requests": 4,
+            "requestUnits": {
+                "daily": 4_000,
+                "used": 68,
+                "remaining": 3_932,
+                "percentUsed": 1.7
+            }
+        });
+
+        let summary = usage_summary(&usage);
+
+        assert_eq!(summary.daily, 4_000.0);
+        assert_eq!(summary.used, 68.0);
+        assert_eq!(summary.remaining, 3_932.0);
+        assert_eq!(summary.percent_used, 1.7);
     }
 
     #[test]

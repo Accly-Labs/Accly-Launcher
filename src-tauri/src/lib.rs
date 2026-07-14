@@ -1,5 +1,8 @@
+mod agent_runtime;
 mod agents;
 mod api;
+
+use tauri::Emitter;
 
 #[tauri::command]
 fn get_launcher_session() -> Result<Option<api::LauncherSession>, String> {
@@ -24,13 +27,60 @@ async fn poll_device_authorization(
 }
 
 #[tauri::command]
-fn detect_agents() -> Result<Vec<agents::AgentDetection>, String> {
-    agents::detect_agents()
+async fn detect_agents() -> Result<Vec<agents::AgentDetection>, String> {
+    tauri::async_runtime::spawn_blocking(agents::detect_agents)
+        .await
+        .map_err(|error| format!("Agent detection task failed: {error}"))?
 }
 
 #[tauri::command]
 fn configure_agent(config: agents::AgentConfiguration) -> Result<agents::ConfigureResult, String> {
     agents::configure_agent(config)
+}
+
+#[tauri::command]
+async fn install_agent(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<agents::AgentLifecycleResult, String> {
+    let event_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        agents::install_agent_with_progress(agent_id, move |progress| {
+            let _ = event_app.emit("agent-lifecycle", progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Agent installation task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn update_agent(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<agents::AgentLifecycleResult, String> {
+    let event_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        agents::update_agent_with_progress(agent_id, move |progress| {
+            let _ = event_app.emit("agent-lifecycle", progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Agent update task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn repair_agent(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<agents::AgentLifecycleResult, String> {
+    let event_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        agents::repair_agent_with_progress(agent_id, move |progress| {
+            let _ = event_app.emit("agent-lifecycle", progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Agent repair task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -73,6 +123,9 @@ pub fn run() {
             poll_device_authorization,
             detect_agents,
             configure_agent,
+            install_agent,
+            update_agent,
+            repair_agent,
             validate_agent,
             get_account_snapshot,
             create_api_key,

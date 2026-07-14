@@ -13,6 +13,13 @@ export interface AgentDetection {
   configPath: string | null;
   detail: string;
   icon: string;
+  version: string | null;
+  installSource: string | null;
+  executablePath: string | null;
+  installationCount: number;
+  canInstall: boolean;
+  canUpdate: boolean;
+  canRepair: boolean;
 }
 
 export interface AgentConfiguration {
@@ -26,6 +33,26 @@ export interface ConfigureResult {
   agentId: AgentId;
   configPath: string;
   backupPath: string;
+  message: string;
+}
+
+export interface AgentLifecycleResult {
+  agent: AgentDetection;
+  action: "install" | "update" | "repair";
+  message: string;
+}
+
+export interface AgentLifecycleProgress {
+  agentId: AgentId;
+  action: "install" | "update" | "repair";
+  phase:
+    | "checking"
+    | "installing"
+    | "updating"
+    | "repairing"
+    | "scanning"
+    | "completed"
+    | "failed";
   message: string;
 }
 

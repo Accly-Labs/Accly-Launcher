@@ -3,6 +3,8 @@ import type {
   AccountSnapshot,
   AgentConfiguration,
   AgentDetection,
+  AgentLifecycleResult,
+  AgentLifecycleProgress,
   ApiKeyGroup,
   ApiKeyRecord,
   CompatibleModel,
@@ -26,10 +28,10 @@ const now = new Date().toISOString();
 
 const demoSnapshot: AccountSnapshot = {
   plan: {
-    planName: "Pro",
+    planName: "Max",
     paid: true,
     suspended: false,
-    allowedTiers: ["starter", "pro"],
+    allowedTiers: ["basic", "advanced", "thinking", "beta"],
   },
   usage: {
     used: 174_260,
@@ -41,7 +43,7 @@ const demoSnapshot: AccountSnapshot = {
     {
       prefix: "sk-accly-7H2P",
       groupType: "universal",
-      allowedTiers: ["starter", "pro"],
+      allowedTiers: ["basic", "advanced", "thinking", "beta"],
       createdAt: now,
     },
   ],
@@ -60,6 +62,13 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/.codex/config.toml",
     detail: "Ready to connect",
     icon: "/codex-color.svg",
+    version: "0.99.0",
+    installSource: "npm",
+    executablePath: "~/.npm-global/bin/codex",
+    installationCount: 1,
+    canInstall: false,
+    canUpdate: true,
+    canRepair: false,
   },
   {
     id: "claude-code",
@@ -70,6 +79,13 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/.claude/settings.json",
     detail: "Detected",
     icon: "/claudecode-color.svg",
+    version: "2.1.0",
+    installSource: "npm",
+    executablePath: "~/.npm-global/bin/claude",
+    installationCount: 1,
+    canInstall: false,
+    canUpdate: true,
+    canRepair: false,
   },
   {
     id: "gemini-cli",
@@ -80,6 +96,13 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/.gemini/.env",
     detail: "Not installed",
     icon: "",
+    version: null,
+    installSource: null,
+    executablePath: null,
+    installationCount: 0,
+    canInstall: true,
+    canUpdate: false,
+    canRepair: false,
   },
   {
     id: "opencode",
@@ -90,6 +113,13 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/.config/opencode/opencode.json",
     detail: "Not installed",
     icon: "/opencode.svg",
+    version: null,
+    installSource: null,
+    executablePath: null,
+    installationCount: 0,
+    canInstall: true,
+    canUpdate: false,
+    canRepair: false,
   },
   {
     id: "cursor",
@@ -100,6 +130,13 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/Library/Application Support/Cursor/User/settings.json",
     detail: "No safe gateway config detected",
     icon: "/cursor.svg",
+    version: null,
+    installSource: null,
+    executablePath: null,
+    installationCount: 0,
+    canInstall: false,
+    canUpdate: false,
+    canRepair: false,
   },
   {
     id: "windsurf",
@@ -110,37 +147,79 @@ const demoAgents: AgentDetection[] = [
     configPath: "~/Library/Application Support/Windsurf/User/settings.json",
     detail: "No safe gateway config detected",
     icon: "/windsurf.svg",
+    version: null,
+    installSource: null,
+    executablePath: null,
+    installationCount: 0,
+    canInstall: false,
+    canUpdate: false,
+    canRepair: false,
   },
 ];
 
 export const compatibleModels: CompatibleModel[] = [
   {
-    id: "gpt-5.4-codex",
-    label: "GPT-5.4 Codex",
-    tier: "pro",
+    id: "gpt-5-4-mini",
+    label: "GPT-5.4 Mini",
+    tier: "basic",
     agents: ["codex", "opencode"],
     protocol: "responses",
   },
   {
-    id: "claude-opus-4-6",
-    label: "Claude Opus 4.6",
-    tier: "pro",
+    id: "gpt-5-4",
+    label: "GPT-5.4",
+    tier: "advanced",
+    agents: ["codex", "opencode"],
+    protocol: "responses",
+  },
+  {
+    id: "gpt-5-4-pro",
+    label: "GPT-5.4 Pro",
+    tier: "beta",
+    agents: ["codex", "opencode"],
+    protocol: "responses",
+  },
+  {
+    id: "claude-haiku-4-5-20251001",
+    label: "Claude Haiku 4.5",
+    tier: "basic",
     agents: ["claude-code", "opencode"],
     protocol: "anthropic",
   },
   {
-    id: "gemini-3.1-pro",
-    label: "Gemini 3.1 Pro",
-    tier: "pro",
+    id: "claude-sonnet-4-6",
+    label: "Claude Sonnet 4.6",
+    tier: "advanced",
+    agents: ["claude-code", "opencode"],
+    protocol: "anthropic",
+  },
+  {
+    id: "claude-sonnet-4-6-thinking",
+    label: "Claude Sonnet 4.6 Thinking",
+    tier: "thinking",
+    agents: ["claude-code", "opencode"],
+    protocol: "anthropic",
+  },
+  {
+    id: "gemini-3.1-flash-lite",
+    label: "Gemini 3.1 Flash-Lite",
+    tier: "basic",
     agents: ["gemini-cli", "opencode"],
     protocol: "google",
   },
   {
-    id: "gpt-5.4-mini",
-    label: "GPT-5.4 Mini",
-    tier: "starter",
-    agents: ["codex", "opencode"],
-    protocol: "responses",
+    id: "gemini-3.5-flash",
+    label: "Gemini 3.5 Flash",
+    tier: "advanced",
+    agents: ["gemini-cli", "opencode"],
+    protocol: "google",
+  },
+  {
+    id: "gemini-3.1-pro-preview",
+    label: "Gemini 3.1 Pro Preview",
+    tier: "advanced",
+    agents: ["gemini-cli", "opencode"],
+    protocol: "google",
   },
 ];
 
@@ -154,7 +233,7 @@ function demoKey(groupType: ApiKeyGroup): CreatedApiKey {
     prefix: `sk-accly-${suffix.slice(0, 4)}`,
     fullKey: `sk-accly-dev-${suffix}`,
     groupType,
-    allowedTiers: ["starter", "pro"],
+    allowedTiers: ["basic", "advanced", "thinking", "beta"],
     createdAt: new Date().toISOString(),
   };
 }
@@ -234,6 +313,77 @@ export async function configureAgent(
     };
   }
   return invoke<ConfigureResult>("configure_agent", { config });
+}
+
+function completeDemoAgentLifecycle(
+  agentId: AgentDetection["id"],
+  action: AgentLifecycleResult["action"],
+): AgentLifecycleResult {
+  const agent = demoAgents.find(({ id }) => id === agentId);
+  if (
+    !agent?.configurable ||
+    (!agent.canInstall && action === "install") ||
+    (!agent.canRepair && action === "repair")
+  ) {
+    throw new Error("This agent cannot be installed by Accly Launcher.");
+  }
+
+  if (action === "install") {
+    agent.installed = true;
+    agent.state = "installed";
+    agent.detail = "Installed, ready to configure";
+    agent.version = "latest";
+    agent.installSource = "npm";
+    agent.executablePath = `~/.npm-global/bin/${agent.id === "claude-code" ? "claude" : agent.id === "gemini-cli" ? "gemini" : agent.id}`;
+    agent.installationCount = 1;
+    agent.canInstall = false;
+    agent.canUpdate = true;
+    agent.canRepair = false;
+  }
+
+  if (action === "repair") {
+    agent.state = "installed";
+    agent.detail = "Repaired, ready to configure";
+    agent.canRepair = false;
+    agent.canUpdate = true;
+  }
+
+  return {
+    agent: { ...agent },
+    action,
+    message: `${agent.name} ${action} completed. Scan results were refreshed.`,
+  };
+}
+
+export async function installAgent(
+  agentId: AgentDetection["id"],
+): Promise<AgentLifecycleResult> {
+  if (!isTauri()) return completeDemoAgentLifecycle(agentId, "install");
+  return invoke<AgentLifecycleResult>("install_agent", { agentId });
+}
+
+export async function updateAgent(
+  agentId: AgentDetection["id"],
+): Promise<AgentLifecycleResult> {
+  if (!isTauri()) return completeDemoAgentLifecycle(agentId, "update");
+  return invoke<AgentLifecycleResult>("update_agent", { agentId });
+}
+
+export async function repairAgent(
+  agentId: AgentDetection["id"],
+): Promise<AgentLifecycleResult> {
+  if (!isTauri()) return completeDemoAgentLifecycle(agentId, "repair");
+  return invoke<AgentLifecycleResult>("repair_agent", { agentId });
+}
+
+export async function listenForAgentLifecycleProgress(
+  onProgress: (progress: AgentLifecycleProgress) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<AgentLifecycleProgress>("agent-lifecycle", (event) => {
+    onProgress(event.payload);
+  });
 }
 
 export async function createApiKey(
