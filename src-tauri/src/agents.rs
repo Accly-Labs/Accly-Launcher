@@ -602,7 +602,22 @@ impl AgentAdapter for GeminiAdapter {
     }
 }
 
-struct OpenCodeAdapter;
+struct OpenCodeAdapter {
+    config_home: Option<PathBuf>,
+}
+
+impl OpenCodeAdapter {
+    fn new() -> Self {
+        Self { config_home: None }
+    }
+
+    fn config_directory(&self, home: &Path) -> PathBuf {
+        self.config_home
+            .as_deref()
+            .map(|config_home| config_home.join("opencode"))
+            .unwrap_or_else(|| opencode_config_directory(home))
+    }
+}
 
 impl AgentAdapter for OpenCodeAdapter {
     fn id(&self) -> &'static str {
@@ -618,7 +633,7 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 
     fn config_paths(&self, home: &Path) -> Vec<PathBuf> {
-        let directory = opencode_config_directory(home);
+        let directory = self.config_directory(home);
         vec![
             directory.join("opencode.jsonc"),
             directory.join("opencode.json"),
@@ -786,7 +801,7 @@ fn adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(CodexAdapter),
         Box::new(ClaudeCodeAdapter),
         Box::new(GeminiAdapter),
-        Box::new(OpenCodeAdapter),
+        Box::new(OpenCodeAdapter::new()),
         Box::new(CursorAdapter),
         Box::new(WindsurfAdapter),
     ]
@@ -1507,7 +1522,9 @@ mod tests {
             model: "gpt-5-4".to_string(),
         };
 
-        let adapter = OpenCodeAdapter;
+        let adapter = OpenCodeAdapter {
+            config_home: Some(home.path().join(".config")),
+        };
         assert_eq!(adapter.primary_path(home.path()), path);
         let writes = adapter.prepare(&configuration, home.path()).unwrap();
         let output = String::from_utf8(writes[0].contents.clone()).unwrap();
