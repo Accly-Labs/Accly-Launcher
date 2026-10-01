@@ -94,8 +94,13 @@ async fn get_account_snapshot() -> Result<api::AccountSnapshot, String> {
 }
 
 #[tauri::command]
-async fn create_api_key(group_type: String) -> Result<api::CreatedApiKey, String> {
-    api::create_api_key(group_type).await
+async fn create_api_key(options: api::CreateApiKeyRequest) -> Result<api::CreatedApiKey, String> {
+    api::create_api_key(options).await
+}
+
+#[tauri::command]
+async fn get_model_catalog() -> Result<Vec<api::ModelCatalogRecord>, String> {
+    api::get_model_catalog().await
 }
 
 #[tauri::command]
@@ -129,6 +134,7 @@ pub fn run() {
             validate_agent,
             get_account_snapshot,
             create_api_key,
+            get_model_catalog,
             delete_api_key,
             regenerate_api_key,
             check_for_update,

@@ -5,7 +5,7 @@ import type {
   AgentDetection,
   AgentLifecycleResult,
   AgentLifecycleProgress,
-  ApiKeyGroup,
+  ApiKeyCreateOptions,
   ApiKeyRecord,
   CompatibleModel,
   ConfigureResult,
@@ -13,6 +13,7 @@ import type {
   DeviceCode,
   DeviceAuthorizationPoll,
   LauncherSession,
+  ModelCatalogRecord,
 } from "./types";
 
 type UpdateStatus = {
@@ -41,9 +42,17 @@ const demoSnapshot: AccountSnapshot = {
   },
   keys: [
     {
+      name: "Launcher key",
       prefix: "sk-accly-7H2P",
       groupType: "universal",
       allowedTiers: ["basic", "advanced", "thinking", "beta"],
+      allowedModelIds: [],
+      creditLimitUsd: null,
+      creditUsedUsd: 0,
+      expiresAt: null,
+      disabledReason: null,
+      isActive: true,
+      lastUsedAt: null,
       createdAt: now,
     },
   ],
@@ -110,7 +119,7 @@ const demoAgents: AgentDetection[] = [
     state: "missing",
     installed: false,
     configurable: true,
-    configPath: "~/.config/opencode/opencode.json",
+    configPath: "~/.config/opencode/opencode.json[c]",
     detail: "Not installed",
     icon: "/opencode.svg",
     version: null,
@@ -223,17 +232,25 @@ export const compatibleModels: CompatibleModel[] = [
   },
 ];
 
-function demoKey(groupType: ApiKeyGroup): CreatedApiKey {
+function demoKey(options: ApiKeyCreateOptions): CreatedApiKey {
   const suffix = crypto
     .randomUUID()
     .replace(/-/g, "")
     .slice(0, 8)
     .toUpperCase();
   return {
+    name: options.name,
     prefix: `sk-accly-${suffix.slice(0, 4)}`,
     fullKey: `sk-accly-dev-${suffix}`,
-    groupType,
+    groupType: "universal",
     allowedTiers: ["basic", "advanced", "thinking", "beta"],
+    allowedModelIds: options.allowedModelIds,
+    creditLimitUsd: options.creditLimitUsd,
+    creditUsedUsd: 0,
+    expiresAt: options.expiresAt,
+    disabledReason: null,
+    isActive: true,
+    lastUsedAt: null,
     createdAt: new Date().toISOString(),
   };
 }
@@ -387,14 +404,28 @@ export async function listenForAgentLifecycleProgress(
 }
 
 export async function createApiKey(
-  groupType: ApiKeyGroup,
+  options: ApiKeyCreateOptions,
 ): Promise<CreatedApiKey> {
   if (!isTauri()) {
-    const key = demoKey(groupType);
+    const key = demoKey(options);
     demoKeys = [key, ...demoKeys];
     return key;
   }
-  return invoke<CreatedApiKey>("create_api_key", { groupType });
+  return invoke<CreatedApiKey>("create_api_key", { options });
+}
+
+export async function getModelCatalog(): Promise<ModelCatalogRecord[]> {
+  if (!isTauri()) {
+    return compatibleModels.map((model) => ({
+      id: model.id,
+      name: model.label,
+      providerFamily: model.protocol,
+      modelType: "generation",
+      apiOnly: false,
+      tier: model.tier,
+    }));
+  }
+  return invoke<ModelCatalogRecord[]>("get_model_catalog");
 }
 
 export async function deleteApiKey(prefix: string): Promise<void> {
@@ -409,7 +440,12 @@ export async function regenerateApiKey(prefix: string): Promise<CreatedApiKey> {
   if (!isTauri()) {
     const previous = demoKeys.find((key) => key.prefix === prefix);
     if (!previous) throw new Error("The API key no longer exists.");
-    const replacement = demoKey(previous.groupType);
+    const replacement = demoKey({
+      name: previous.name,
+      allowedModelIds: previous.allowedModelIds,
+      creditLimitUsd: previous.creditLimitUsd,
+      expiresAt: previous.expiresAt,
+    });
     demoKeys = [
       replacement,
       ...demoKeys.filter((key) => key.prefix !== prefix),

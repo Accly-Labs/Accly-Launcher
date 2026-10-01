@@ -21,9 +21,11 @@ The native application supports macOS, Windows, and Linux. Windows support is
 native; WSL is a separate environment and is not scanned or configured through
 the Windows build.
 
-On each supported operating system, the agent scanner searches `PATH` plus
-common locations for npm, pnpm, Volta, Bun, Homebrew/Linuxbrew, Scoop, and
-native installations. It records the executable path, reported version,
+On each supported operating system, the agent scanner searches the inherited
+`PATH`, the user's login-shell `PATH`, and common locations for npm, nvm, fnm,
+mise, pnpm, Volta, Bun, Homebrew/Linuxbrew, Scoop, and native installations.
+It also checks fnm multishell directories and the standalone Windows Codex and
+Claude installers. The scanner records the executable path, reported version,
 inferred install source, and number of discovered installations. The first
 discovered installation is shown as the primary one; an unavailable primary is
 marked as broken.
@@ -41,7 +43,7 @@ workspace indefinitely.
 | Codex       | Detect, install, update/repair, and rescan       | `~/.codex/config.toml` and `auth.json`                                          |
 | Claude Code | Detect, install, update/repair, and rescan       | `~/.claude/settings.json`                                                       |
 | Gemini CLI  | Detect, install, update/repair, and rescan       | `~/.gemini/.env` and `settings.json`                                            |
-| OpenCode    | Detect, install, update/repair, and rescan       | `$XDG_CONFIG_HOME/opencode/opencode.json` or `~/.config/opencode/opencode.json` |
+| OpenCode    | Detect, install, update/repair, and rescan       | `$XDG_CONFIG_HOME/opencode/opencode.json` or `.jsonc` (same under `~/.config`)       |
 | Cursor      | App and settings detection only                  | Not enabled without a verified gateway contract                                 |
 | Windsurf    | App and settings detection only                  | Not enabled without a verified gateway contract                                 |
 
@@ -61,14 +63,14 @@ a shell command or package name from the renderer, never installs Node.js for
 the user, and never runs a remote script. Node.js and npm must already be
 installed and discoverable to use **Install**.
 
-`Update` is enabled only when the detected installation is managed by npm or
-pnpm. Homebrew, Linuxbrew, Volta, Bun, Scoop, native installers, and system
-packages remain source-owned: update them with their original installer, then
-scan again. This avoids replacing a deliberately managed installation with a
-second global npm copy. The launcher also verifies that the selected npm/pnpm
-global bin directory matches the detected executable before updating. Multiple
-installations disable automatic updates until the user resolves the intended
-copy.
+`Update` is enabled only when the detected installation is managed by npm,
+nvm, fnm, mise, or pnpm. Homebrew, Linuxbrew, Volta, Bun, Scoop, native
+installers, and system packages remain source-owned: update them with their
+original installer, then scan again. This avoids replacing a deliberately
+managed installation with a second global npm copy. The launcher also verifies
+that the selected npm/pnpm global bin directory matches the detected executable
+before updating. Multiple installations disable automatic updates until the
+user resolves the intended copy.
 
 If an npm/pnpm-managed executable is present but cannot run, **Repair** repeats
 the allowlisted package install against that same verified global directory.
@@ -88,8 +90,10 @@ configuration contract exists.
 Each configurable agent is implemented as a Rust `AgentAdapter`. A shared
 `FileTransaction` backs up original bytes, rejects symlinked targets, writes
 atomically, validates the result, and restores the previous configuration on
-failure. Non-strict JSON and JSONC targets are left unchanged rather than being
-rewritten with formatting or comments lost.
+failure. Invalid JSON and JSONC targets are left unchanged rather than being
+partially rewritten. OpenCode JSONC is parsed using its JSON5-compatible
+syntax; the resulting file is written as valid JSON while preserving all
+existing configuration values.
 
 Gemini CLI uses the native Google Generative AI protocol. Its configured base
 URL is the gateway origin without `/v1` or `/v1beta`; Gemini CLI supplies that
@@ -151,6 +155,17 @@ builds, set `ACCLY_AUTH_URL`, `ACCLY_CORE_URL`, and
 `ACCLY_LAUNCHER_CLIENT_ID` in the build environment.
 `VITE_ACCLY_GATEWAY_URL` is bundled into the renderer for agent configuration.
 See `.env.example`.
+
+For a local native bundle, include the `local` feature and point all services at
+localhost:
+
+```sh
+ACCLY_AUTH_URL=http://localhost:3003 \
+ACCLY_CORE_URL=http://localhost:3001 \
+ACCLY_LAUNCHER_CLIENT_ID=accly-launcher \
+VITE_ACCLY_GATEWAY_URL=http://localhost:8080 \
+pnpm tauri build --debug --features local
+```
 
 ## Backend handoff
 

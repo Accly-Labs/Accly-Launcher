@@ -36,6 +36,7 @@ import {
   createApiKey,
   deleteApiKey,
   getAccountSnapshot,
+  getModelCatalog,
   getLauncherSession,
   listAgents,
   listenForAgentLifecycleProgress,
@@ -49,11 +50,12 @@ import type {
   AgentDetection,
   AgentId,
   AgentLifecycleProgress,
-  ApiKeyGroup,
+  ApiKeyCreateOptions,
   ApiKeyRecord,
   CompatibleModel,
   CreatedApiKey,
   DeviceCode,
+  ModelCatalogRecord,
 } from "./lib/types";
 import { formatDate, formatUsage } from "./lib/utils";
 
@@ -70,6 +72,63 @@ const SESSION_EXPIRED_MESSAGE =
 type PendingDeviceCode = DeviceCode & {
   expiresAt: number;
 };
+
+type KeyExpirationMode = "never" | "hour" | "day" | "month" | "custom";
+
+type KeyFormState = {
+  name: string;
+  allowedModelIds: string[];
+  unlimitedCredits: boolean;
+  creditLimitUsd: string;
+  expirationMode: KeyExpirationMode;
+  customExpiresAt: string;
+};
+
+const emptyKeyForm = (): KeyFormState => ({
+  name: "Launcher key",
+  allowedModelIds: [],
+  unlimitedCredits: true,
+  creditLimitUsd: "",
+  expirationMode: "never",
+  customExpiresAt: "",
+});
+
+function expirationDateFor(form: KeyFormState): string | null {
+  if (form.expirationMode === "never") return null;
+  if (form.expirationMode === "custom") {
+    const date = new Date(form.customExpiresAt);
+    if (!form.customExpiresAt || Number.isNaN(date.getTime())) return null;
+    return date.toISOString();
+  }
+
+  const date = new Date();
+  const durations: Record<
+    Exclude<KeyExpirationMode, "never" | "custom">,
+    number
+  > = {
+    hour: 60 * 60 * 1000,
+    day: 24 * 60 * 60 * 1000,
+    month: 30 * 24 * 60 * 60 * 1000,
+  };
+  date.setTime(date.getTime() + durations[form.expirationMode]);
+  return date.toISOString();
+}
+
+function localDateTimeInputValue(date: Date): string {
+  const timezoneOffset = date.getTimezoneOffset();
+  return new Date(date.getTime() - timezoneOffset * 60_000)
+    .toISOString()
+    .slice(0, 16);
+}
+
+function keyOptionsForForm(form: KeyFormState): ApiKeyCreateOptions {
+  return {
+    name: form.name.trim(),
+    allowedModelIds: form.allowedModelIds,
+    creditLimitUsd: form.unlimitedCredits ? null : Number(form.creditLimitUsd),
+    expiresAt: expirationDateFor(form),
+  };
+}
 
 const gatewayUrl =
   import.meta.env.VITE_ACCLY_GATEWAY_URL ?? "https://api.accly.net";
@@ -290,8 +349,30 @@ function KeyDialog({
   onChanged: () => Promise<void>;
   onNotice: (notice: Notice) => void;
 }) {
-  const [group, setGroup] = useState<ApiKeyGroup>("universal");
+  const [form, setForm] = useState<KeyFormState>(emptyKeyForm);
   const [created, setCreated] = useState<CreatedApiKey | null>(null);
+
+  const modelQuery = useQuery({
+    queryKey: ["launcher-model-catalog"],
+    queryFn: getModelCatalog,
+    enabled: open,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  const models = useMemo<ModelCatalogRecord[]>(
+    () =>
+      modelQuery.data?.length
+        ? modelQuery.data
+        : compatibleModels.map((model) => ({
+            id: model.id,
+            name: model.label,
+            providerFamily: model.protocol,
+            modelType: "generation",
+            apiOnly: false,
+            tier: model.tier,
+          })),
+    [modelQuery.data],
+  );
 
   const createMutation = useMutation({
     mutationFn: createApiKey,
@@ -300,6 +381,25 @@ function KeyDialog({
       await onChanged();
     },
   });
+
+  const setFormValue = (patch: Partial<KeyFormState>) =>
+    setForm((current) => ({ ...current, ...patch }));
+  const toggleModel = (modelId: string) =>
+    setForm((current) => ({
+      ...current,
+      allowedModelIds: current.allowedModelIds.includes(modelId)
+        ? current.allowedModelIds.filter((id) => id !== modelId)
+        : [...current.allowedModelIds, modelId],
+    }));
+  const options = keyOptionsForForm(form);
+  const invalidLimit =
+    !form.unlimitedCredits &&
+    (!Number.isFinite(Number(form.creditLimitUsd)) ||
+      Number(form.creditLimitUsd) <= 0);
+  const invalidExpiration =
+    form.expirationMode === "custom" && options.expiresAt === null;
+  const canCreate =
+    form.name.trim().length >= 2 && !invalidLimit && !invalidExpiration;
 
   const deleteMutation = useMutation({
     mutationFn: deleteApiKey,
@@ -327,7 +427,10 @@ function KeyDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (!nextOpen) setCreated(null);
+        if (!nextOpen) {
+          setCreated(null);
+          setForm(emptyKeyForm());
+        }
         onOpenChange(nextOpen);
       }}
     >
@@ -354,30 +457,173 @@ function KeyDialog({
           ) : null}
 
           <div>
-            <label className="field-label" htmlFor="key-group">
-              Key access
+            <label className="field-label" htmlFor="key-name">
+              Key name
             </label>
-            <select
-              id="key-group"
+            <input
+              id="key-name"
               className="select-field"
-              value={group}
-              onChange={(event) => setGroup(event.target.value as ApiKeyGroup)}
-            >
-              <option value="universal">Universal</option>
-              <option value="openai">OpenAI-compatible</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="google">Google</option>
-            </select>
+              type="text"
+              maxLength={80}
+              value={form.name}
+              onChange={(event) => setFormValue({ name: event.target.value })}
+            />
           </div>
+
+          <section
+            className="key-setting-section"
+            aria-labelledby="key-models-title"
+          >
+            <div className="key-setting-heading">
+              <div>
+                <h3 id="key-models-title">Model access</h3>
+                <p>
+                  {form.allowedModelIds.length
+                    ? `${form.allowedModelIds.length} selected`
+                    : "All models"}
+                </p>
+              </div>
+            </div>
+            <div className="key-model-list">
+              <label className="key-option">
+                <input
+                  type="checkbox"
+                  checked={form.allowedModelIds.length === 0}
+                  onChange={() => setFormValue({ allowedModelIds: [] })}
+                />
+                <span>All models</span>
+              </label>
+              {models.map((model) => (
+                <label className="key-option" key={model.id}>
+                  <input
+                    type="checkbox"
+                    checked={form.allowedModelIds.includes(model.id)}
+                    onChange={() => toggleModel(model.id)}
+                  />
+                  <span className="key-option-copy">
+                    <span>{model.name}</span>
+                    <small>
+                      {model.providerFamily} · {model.tier}
+                    </small>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </section>
+
+          <section
+            className="key-setting-section"
+            aria-labelledby="key-credit-title"
+          >
+            <div className="key-setting-heading">
+              <div>
+                <h3 id="key-credit-title">Credit spending limit</h3>
+                <p>Disable this key automatically at the limit.</p>
+              </div>
+              <label className="key-toggle">
+                <input
+                  type="checkbox"
+                  checked={form.unlimitedCredits}
+                  onChange={(event) =>
+                    setFormValue({ unlimitedCredits: event.target.checked })
+                  }
+                />
+                <span>No limit</span>
+              </label>
+            </div>
+            {!form.unlimitedCredits ? (
+              <label className="key-inline-input" htmlFor="key-credit-limit">
+                <span>$</span>
+                <input
+                  id="key-credit-limit"
+                  className="select-field"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  placeholder="Limit in USD"
+                  value={form.creditLimitUsd}
+                  onChange={(event) =>
+                    setFormValue({ creditLimitUsd: event.target.value })
+                  }
+                />
+              </label>
+            ) : null}
+          </section>
+
+          <section
+            className="key-setting-section"
+            aria-labelledby="key-expiration-title"
+          >
+            <div className="key-setting-heading">
+              <div>
+                <h3 id="key-expiration-title">Expiration</h3>
+                <p>
+                  {form.expirationMode === "never"
+                    ? "Never expires"
+                    : "Key stops working automatically"}
+                </p>
+              </div>
+            </div>
+            <div
+              className="key-expiration-options"
+              role="radiogroup"
+              aria-label="Expiration"
+            >
+              {(
+                [
+                  ["never", "Never"],
+                  ["hour", "1 hour"],
+                  ["day", "1 day"],
+                  ["month", "1 month"],
+                  ["custom", "Custom"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={form.expirationMode === value}
+                  className={form.expirationMode === value ? "is-selected" : ""}
+                  onClick={() => setFormValue({ expirationMode: value })}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {form.expirationMode === "custom" ? (
+              <input
+                className="select-field"
+                type="datetime-local"
+                min={localDateTimeInputValue(new Date(Date.now() + 60_000))}
+                value={form.customExpiresAt}
+                onChange={(event) =>
+                  setFormValue({ customExpiresAt: event.target.value })
+                }
+              />
+            ) : null}
+          </section>
 
           <div>
             {keys.length ? (
               keys.map((key) => (
                 <div className="key-row" key={key.prefix}>
                   <div className="min-w-0">
-                    <p className="key-prefix">{key.prefix}</p>
+                    <p className="key-prefix">{key.name}</p>
                     <p className="key-meta">
-                      {key.groupType} · {formatDate(key.createdAt)}
+                      {key.prefix} · {formatDate(key.createdAt)}
+                    </p>
+                    <p className="key-meta">
+                      {key.allowedModelIds.length
+                        ? `${key.allowedModelIds.length} models`
+                        : "All models"}{" "}
+                      ·{" "}
+                      {key.creditLimitUsd === null
+                        ? "No limit"
+                        : `$${key.creditUsedUsd.toFixed(2)} / $${key.creditLimitUsd.toFixed(2)}`}{" "}
+                      ·{" "}
+                      {key.expiresAt
+                        ? `Until ${formatDate(key.expiresAt)}`
+                        : "Never expires"}
                     </p>
                   </div>
                   <div className="key-actions">
@@ -430,10 +676,10 @@ function KeyDialog({
         <DialogFooter>
           <Button
             variant="primary"
-            disabled={createMutation.isPending}
+            disabled={createMutation.isPending || !canCreate}
             onClick={() =>
               void createMutation
-                .mutateAsync(group)
+                .mutateAsync(options)
                 .catch((error) =>
                   onNotice({ tone: "error", message: messageFrom(error) }),
                 )
@@ -460,18 +706,6 @@ export function compatibleModelsForAgent(
     (model) =>
       model.agents.includes(agentId) && allowedTiers.includes(model.tier),
   );
-}
-
-export function keyGroupForAgentModel(
-  agentId: AgentId,
-  model: CompatibleModel,
-): ApiKeyGroup {
-  if (agentId === "opencode") return "universal";
-  if (model.protocol === "anthropic") return "anthropic";
-  if (model.protocol === "google") return "google";
-  if (model.protocol === "openai" || model.protocol === "responses")
-    return "openai";
-  return "universal";
 }
 
 function AgentConfigurationDialog({
@@ -592,7 +826,12 @@ function AgentConfigurationDialog({
               onClick={() =>
                 selectedModel &&
                 void keyMutation
-                  .mutateAsync(keyGroupForAgentModel(agent.id, selectedModel))
+                  .mutateAsync({
+                    name: `${agent.name} - ${selectedModel.label}`,
+                    allowedModelIds: [selectedModel.id],
+                    creditLimitUsd: null,
+                    expiresAt: null,
+                  })
                   .catch((error) =>
                     onNotice({ tone: "error", message: messageFrom(error) }),
                   )

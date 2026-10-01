@@ -2,6 +2,19 @@
 
 All notable user-facing changes to Accly Launcher are documented here.
 
+## Unreleased
+
+### Changed
+
+- Agent discovery now includes login-shell PATH entries, nvm/fnm/mise
+  installations, fnm multishells, and standalone Windows Codex and Claude
+  installer locations.
+- nvm, fnm, and mise installations are identified separately and can be
+  updated through their matching npm global directory without switching to a
+  different installation.
+- OpenCode now detects and configures both `opencode.json` and JSONC
+  configuration files.
+
 ## 0.2.2 - 2026-07-14
 
 ### Fixed

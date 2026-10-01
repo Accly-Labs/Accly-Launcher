@@ -618,7 +618,20 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 
     fn config_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![opencode_config_directory(home).join("opencode.json")]
+        let directory = opencode_config_directory(home);
+        vec![
+            directory.join("opencode.jsonc"),
+            directory.join("opencode.json"),
+        ]
+    }
+
+    fn primary_path(&self, home: &Path) -> PathBuf {
+        let paths = self.config_paths(home);
+        paths
+            .iter()
+            .find(|path| path.exists())
+            .cloned()
+            .unwrap_or_else(|| paths[1].clone())
     }
 
     fn command(&self) -> Option<&'static str> {
@@ -1268,12 +1281,26 @@ fn read_json(path: &Path) -> Result<Value, String> {
     }
     let bytes =
         fs::read(path).map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        format!(
-            "{} is not strict JSON and was left unchanged: {error}",
-            path.display()
-        )
-    })
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "jsonc")
+    {
+        let contents = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("{} is not valid UTF-8: {error}", path.display()))?;
+        json5::from_str(contents).map_err(|error| {
+            format!(
+                "{} is not valid JSONC and was left unchanged: {error}",
+                path.display()
+            )
+        })
+    } else {
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "{} is not strict JSON and was left unchanged: {error}",
+                path.display()
+            )
+        })
+    }
 }
 
 fn serialize_json(value: &Value, path: &Path) -> Result<Vec<u8>, String> {
@@ -1388,8 +1415,9 @@ fn parse_env(contents: &str) -> std::collections::HashMap<String, String> {
 mod tests {
     use super::{
         api_base_url, gemini_base_url, parse_env, patch_env, AgentAdapter, AgentConfiguration,
-        CodexAdapter, GeminiAdapter,
+        CodexAdapter, GeminiAdapter, OpenCodeAdapter,
     };
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -1459,6 +1487,36 @@ mod tests {
 
         assert!(config.contains("base_url = \"http://localhost:8080/v1\""));
         assert!(config.contains("model = \"gpt-5-4\""));
+    }
+
+    #[test]
+    fn configures_existing_opencode_jsonc_without_dropping_unrelated_values() {
+        let home = tempdir().unwrap();
+        let directory = home.path().join(".config/opencode");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("opencode.jsonc");
+        fs::write(
+            &path,
+            "{\n  // Keep local preferences.\n  \"theme\": \"catppuccin\",\n  \"provider\": {},\n}\n",
+        )
+        .unwrap();
+        let configuration = AgentConfiguration {
+            agent_id: "opencode".to_string(),
+            endpoint: "http://localhost:8080".to_string(),
+            api_key: "test-local-key".to_string(),
+            model: "gpt-5-4".to_string(),
+        };
+
+        let adapter = OpenCodeAdapter;
+        assert_eq!(adapter.primary_path(home.path()), path);
+        let writes = adapter.prepare(&configuration, home.path()).unwrap();
+        let output = String::from_utf8(writes[0].contents.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["theme"], "catppuccin");
+        assert_eq!(
+            parsed["provider"]["accly"]["models"]["gpt-5-4"]["name"],
+            "gpt-5-4"
+        );
     }
 
     #[test]

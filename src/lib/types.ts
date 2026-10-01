@@ -97,13 +97,37 @@ export interface UsageSummary {
 }
 
 export interface ApiKeyRecord {
+  name: string;
   prefix: string;
   groupType: ApiKeyGroup;
   allowedTiers: string[];
+  allowedModelIds: string[];
+  creditLimitUsd: number | null;
+  creditUsedUsd: number;
+  expiresAt: string | null;
+  disabledReason: string | null;
+  isActive: boolean;
+  lastUsedAt: string | null;
   createdAt: string;
 }
 
 export type ApiKeyGroup = "anthropic" | "openai" | "google" | "universal";
+
+export interface ApiKeyCreateOptions {
+  name: string;
+  allowedModelIds: string[];
+  creditLimitUsd: number | null;
+  expiresAt: string | null;
+}
+
+export interface ModelCatalogRecord {
+  id: string;
+  name: string;
+  providerFamily: string;
+  modelType: string;
+  apiOnly: boolean;
+  tier: string;
+}
 
 export interface CreatedApiKey extends ApiKeyRecord {
   fullKey: string;

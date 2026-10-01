@@ -17,6 +17,18 @@ const SESSION_REVOCATION_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_REAUTHENTICATION_MESSAGE: &str =
     "Your launcher session has expired. Reconnect to continue.";
 
+fn default_api_key_name() -> String {
+    "API key".to_string()
+}
+
+fn default_group_type() -> String {
+    "universal".to_string()
+}
+
+fn default_is_active() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCode {
@@ -68,10 +80,27 @@ pub struct UsageSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeyRecord {
+    #[serde(default = "default_api_key_name")]
+    pub name: String,
     pub prefix: String,
+    #[serde(default = "default_group_type")]
     pub group_type: String,
     #[serde(default)]
     pub allowed_tiers: Vec<String>,
+    #[serde(default)]
+    pub allowed_model_ids: Vec<String>,
+    #[serde(default)]
+    pub credit_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub credit_used_usd: f64,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
+    #[serde(default = "default_is_active")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
     pub created_at: String,
 }
 
@@ -131,12 +160,65 @@ struct DeviceTokenErrorResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeyResponse {
+    #[serde(default = "default_api_key_name")]
+    name: String,
     prefix: String,
+    #[serde(default = "default_group_type")]
     group_type: String,
     #[serde(default)]
     allowed_tiers: Vec<String>,
+    #[serde(default)]
+    allowed_model_ids: Vec<String>,
+    #[serde(default)]
+    credit_limit_usd: Option<f64>,
+    #[serde(default)]
+    credit_used_usd: f64,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    disabled_reason: Option<String>,
+    #[serde(default = "default_is_active")]
+    is_active: bool,
+    #[serde(default)]
+    last_used_at: Option<String>,
     created_at: String,
     full_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyRequest {
+    pub name: String,
+    #[serde(default)]
+    pub allowed_model_ids: Vec<String>,
+    #[serde(default)]
+    pub credit_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogRecord {
+    pub id: String,
+    pub name: String,
+    pub provider_family: String,
+    pub model_type: String,
+    pub api_only: bool,
+    pub tier: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCatalogResponse {
+    pub id: String,
+    #[serde(alias = "displayName")]
+    pub name: String,
+    pub provider_family: String,
+    pub model_type: String,
+    #[serde(default)]
+    pub api_only: bool,
+    pub tier: String,
 }
 
 #[derive(Deserialize)]
@@ -579,15 +661,48 @@ fn usage_summary(usage: &Value) -> UsageSummary {
     }
 }
 
-pub async fn create_api_key(group_type: String) -> Result<CreatedApiKey, String> {
-    validate_group_type(&group_type)?;
+pub async fn create_api_key(request: CreateApiKeyRequest) -> Result<CreatedApiKey, String> {
+    let name = request.name.trim().to_string();
+    validate_api_key_name(&name)?;
     let value = authorized_json(
         Method::POST,
         "/api/v1/api-keys",
-        Some(json!({ "groupType": group_type })),
+        Some(json!({
+            "name": name,
+            "allowedModelIds": request.allowed_model_ids,
+            "creditLimitUsd": request.credit_limit_usd,
+            "expiresAt": request.expires_at,
+        })),
     )
     .await?;
     parse_created_key(response_data(&value))
+}
+
+pub async fn get_model_catalog() -> Result<Vec<ModelCatalogRecord>, String> {
+    let mut models = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let value = authorized_json(
+            Method::GET,
+            &format!("/api/v1/launcher/models?page={page}&limit=100"),
+            None,
+        )
+        .await?;
+        let page_models = parse_model_list(response_data(&value))?;
+        let page_count = value
+            .get("pagination")
+            .and_then(|pagination| pagination.get("pages"))
+            .and_then(Value::as_u64)
+            .unwrap_or(page as u64);
+        let page_is_full = page_models.len() == 100;
+        models.extend(page_models);
+
+        if page >= page_count || !page_is_full {
+            return Ok(models);
+        }
+        page += 1;
+    }
 }
 
 pub async fn delete_api_key(prefix: String) -> Result<(), String> {
@@ -730,10 +845,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        device_authorization_poll_result, update_checks_enabled, usage_summary,
-        validate_build_profile, validate_endpoint, validate_verification_uri,
-        verified_launcher_session, DeviceAuthorizationPoll, DeviceTokenErrorResponse, Endpoints,
-        LauncherSessionResponse, PRODUCTION_AUTH_ORIGIN, PRODUCTION_CORE_ORIGIN,
+        device_authorization_poll_result, parse_created_key, parse_key_list, parse_model_list,
+        update_checks_enabled, usage_summary, validate_api_key_name, validate_build_profile,
+        validate_endpoint, validate_verification_uri, verified_launcher_session,
+        DeviceAuthorizationPoll, DeviceTokenErrorResponse, Endpoints, LauncherSessionResponse,
+        PRODUCTION_AUTH_ORIGIN, PRODUCTION_CORE_ORIGIN,
     };
 
     #[test]
@@ -923,6 +1039,83 @@ mod tests {
     }
 
     #[test]
+    fn parses_current_named_api_keys_and_defaults_legacy_metadata() {
+        let keys = parse_key_list(&json!([{
+            "name": "Desktop launcher",
+            "prefix": "sk-abc12345",
+            "allowedModelIds": [],
+            "creditLimitUsd": null,
+            "creditUsedUsd": 0,
+            "expiresAt": null,
+            "disabledReason": null,
+            "isActive": true,
+            "lastUsedAt": null,
+            "createdAt": "2026-10-01T12:00:00.000Z"
+        }]))
+        .expect("current API key list should deserialize");
+
+        assert_eq!(keys[0].name, "Desktop launcher");
+        assert_eq!(keys[0].group_type, "universal");
+        assert!(keys[0].allowed_tiers.is_empty());
+        assert!(keys[0].allowed_model_ids.is_empty());
+        assert_eq!(keys[0].credit_used_usd, 0.0);
+        assert!(keys[0].is_active);
+
+        let legacy = parse_key_list(&json!([{
+            "prefix": "sk-legacy12",
+            "groupType": "openai",
+            "createdAt": "2026-10-01T12:00:00.000Z"
+        }]))
+        .expect("legacy API key list should remain compatible");
+        assert_eq!(legacy[0].name, "API key");
+        assert_eq!(legacy[0].group_type, "openai");
+    }
+
+    #[test]
+    fn parses_current_created_api_keys() {
+        let key = parse_created_key(&json!({
+            "name": "Desktop launcher",
+            "prefix": "sk-abc12345",
+            "allowedModelIds": [],
+            "creditLimitUsd": null,
+            "expiresAt": null,
+            "fullKey": "sk-abc12345-secret",
+            "createdAt": "2026-10-01T12:00:00.000Z",
+            "auditEventId": "audit-123"
+        }))
+        .expect("current created API key should deserialize");
+
+        assert_eq!(key.record.name, "Desktop launcher");
+        assert_eq!(key.record.group_type, "universal");
+        assert_eq!(key.full_key, "sk-abc12345-secret");
+    }
+
+    #[test]
+    fn validates_api_key_names_before_requesting_creation() {
+        assert!(validate_api_key_name("Desktop launcher").is_ok());
+        assert!(validate_api_key_name(" ").is_err());
+        assert!(validate_api_key_name(&"a".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn parses_launcher_model_catalog_records() {
+        let models = parse_model_list(&json!([{
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "providerFamily": "anthropic",
+            "modelType": "generation",
+            "apiOnly": false,
+            "tier": "advanced"
+        }]))
+        .expect("launcher model catalog should deserialize");
+
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
+        assert_eq!(models[0].name, "Claude Sonnet 4.6");
+        assert_eq!(models[0].provider_family, "anthropic");
+        assert_eq!(models[0].tier, "advanced");
+    }
+
+    #[test]
     fn builds_the_pinned_launcher_session_revocation_route() {
         let endpoints = Endpoints {
             auth: PRODUCTION_AUTH_ORIGIN.to_string(),
@@ -981,19 +1174,52 @@ fn parse_created_key(value: &Value) -> Result<CreatedApiKey, String> {
     }
     Ok(CreatedApiKey {
         record: ApiKeyRecord {
+            name: key.name,
             prefix: key.prefix,
             group_type: key.group_type,
             allowed_tiers: key.allowed_tiers,
+            allowed_model_ids: key.allowed_model_ids,
+            credit_limit_usd: key.credit_limit_usd,
+            credit_used_usd: key.credit_used_usd,
+            expires_at: key.expires_at,
+            disabled_reason: key.disabled_reason,
+            is_active: key.is_active,
+            last_used_at: key.last_used_at,
             created_at: key.created_at,
         },
         full_key: key.full_key,
     })
 }
 
-fn validate_group_type(group_type: &str) -> Result<(), String> {
-    if matches!(group_type, "anthropic" | "openai" | "google" | "universal") {
+fn validate_api_key_name(name: &str) -> Result<(), String> {
+    let length = name.chars().count();
+    if (2..=80).contains(&length) {
         Ok(())
     } else {
-        Err("The requested API-key access group is invalid.".to_string())
+        Err("The API key name must be between 2 and 80 characters.".to_string())
     }
+}
+
+fn parse_model_list(value: &Value) -> Result<Vec<ModelCatalogRecord>, String> {
+    let values = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(Value::as_array))
+        .ok_or_else(|| "Accly returned an invalid model catalog.".to_string())?;
+
+    values
+        .iter()
+        .cloned()
+        .map(|model| {
+            let response: ModelCatalogResponse = serde_json::from_value(model)
+                .map_err(|error| format!("Accly returned an invalid model: {error}"))?;
+            Ok(ModelCatalogRecord {
+                id: response.id,
+                name: response.name,
+                provider_family: response.provider_family,
+                model_type: response.model_type,
+                api_only: response.api_only,
+                tier: response.tier,
+            })
+        })
+        .collect()
 }

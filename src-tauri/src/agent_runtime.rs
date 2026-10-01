@@ -36,6 +36,9 @@ impl HostPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstallationSource {
     Npm,
+    Nvm,
+    Fnm,
+    Mise,
     Pnpm,
     Homebrew,
     Volta,
@@ -49,6 +52,9 @@ impl InstallationSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Npm => "npm",
+            Self::Nvm => "nvm",
+            Self::Fnm => "fnm",
+            Self::Mise => "mise",
             Self::Pnpm => "pnpm",
             Self::Homebrew => "Homebrew",
             Self::Volta => "Volta",
@@ -61,7 +67,7 @@ impl InstallationSource {
 
     fn package_manager(self) -> Option<&'static str> {
         match self {
-            Self::Npm => Some("npm"),
+            Self::Npm | Self::Nvm | Self::Fnm | Self::Mise => Some("npm"),
             Self::Pnpm => Some("pnpm"),
             Self::Homebrew
             | Self::Volta
@@ -380,14 +386,63 @@ fn missing_runtime_error(runtime: &str) -> String {
     format!("{runtime} was not found. Install the supported runtime first, then scan again.")
 }
 
+#[cfg(not(target_os = "windows"))]
+fn login_shell_path() -> Option<OsString> {
+    let shell = env::var("SHELL")
+        .ok()
+        .filter(|shell| is_valid_shell(shell))
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let mut command = Command::new(&shell);
+    command
+        .arg(default_flag_for_shell(&shell))
+        .arg("/usr/bin/env")
+        .stdin(Stdio::null());
+    let output = match run_command(command, Duration::from_secs(2)).ok()? {
+        CommandRun::Completed(output) if output.status.success() => output,
+        _ => return None,
+    };
+    let stdout = decode_output(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("PATH="))
+        .find(|path| path.starts_with('/'))
+        .map(OsString::from)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_valid_shell(shell: &str) -> bool {
+    matches!(
+        shell.rsplit('/').next().unwrap_or(shell),
+        "sh" | "bash" | "zsh" | "fish" | "dash"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_flag_for_shell(shell: &str) -> &'static str {
+    match shell.rsplit('/').next().unwrap_or(shell) {
+        "dash" | "sh" => "-c",
+        "fish" => "-lc",
+        _ => "-lic",
+    }
+}
+
 fn binary_search_paths(
     home: &Path,
     platform: HostPlatform,
     extra_search_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let path_entries: Vec<PathBuf> = env::var_os("PATH")
-        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let mut path_entries = Vec::new();
+    #[cfg(not(target_os = "windows"))]
+    if let Some(login_path) = login_shell_path() {
+        for path in env::split_paths(&login_path) {
+            push_unique_path(&mut path_entries, path);
+        }
+    }
+    if let Some(inherited_path) = env::var_os("PATH") {
+        for path in env::split_paths(&inherited_path) {
+            push_unique_path(&mut path_entries, path);
+        }
+    }
     let app_data = env::var_os("APPDATA").map(PathBuf::from);
     let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let program_files = env::var_os("ProgramFiles").map(PathBuf::from);
@@ -433,6 +488,9 @@ fn binary_search_paths_for(
                 home.join(".npm-global/bin"),
                 home.join(".volta/bin"),
                 home.join(".bun/bin"),
+                home.join(".asdf/shims"),
+                home.join(".local/share/mise/shims"),
+                home.join(".mise/shims"),
                 home.join("Library/pnpm"),
                 home.join("bin"),
                 home.join(".opencode/bin"),
@@ -451,6 +509,9 @@ fn binary_search_paths_for(
                 home.join(".npm-global/bin"),
                 home.join(".volta/bin"),
                 home.join(".bun/bin"),
+                home.join(".asdf/shims"),
+                home.join(".local/share/mise/shims"),
+                home.join(".mise/shims"),
                 home.join(".local/share/pnpm"),
                 home.join("bin"),
                 home.join(".opencode/bin"),
@@ -477,6 +538,8 @@ fn binary_search_paths_for(
                 app_data.join("npm"),
                 local_app_data.join("pnpm"),
                 local_app_data.join("Volta/bin"),
+                local_app_data.join("Programs/OpenAI/Codex/bin"),
+                local_app_data.join("Programs/claude"),
                 home.join("scoop/shims"),
                 program_files.join("nodejs"),
             ] {
@@ -501,24 +564,62 @@ fn runtime_manager_paths(home: &Path, platform: HostPlatform) -> Vec<PathBuf> {
     }
 
     let mut paths = Vec::new();
-    for (root, suffix) in [
-        (home.join(".nvm/versions/node"), Path::new("bin")),
+    let mut roots = vec![
+        (home.join(".nvm/versions/node"), PathBuf::from("bin")),
         (
             home.join(".fnm/node-versions"),
-            Path::new("installation/bin"),
+            PathBuf::from("installation/bin"),
         ),
         (
             home.join(".local/share/mise/installs/node"),
-            Path::new("bin"),
+            PathBuf::from("bin"),
         ),
-        (home.join(".mise/installs/node"), Path::new("bin")),
-    ] {
+        (home.join(".mise/installs/node"), PathBuf::from("bin")),
+        (
+            home.join(".local/share/fnm/node-versions"),
+            PathBuf::from("installation/bin"),
+        ),
+        (
+            home.join("Library/Application Support/fnm/node-versions"),
+            PathBuf::from("installation/bin"),
+        ),
+    ];
+    if let Some(nvm_dir) = env::var_os("NVM_DIR").filter(|value| !value.is_empty()) {
+        roots.push((
+            PathBuf::from(nvm_dir).join("versions/node"),
+            PathBuf::from("bin"),
+        ));
+    }
+    if let Some(fnm_dir) = env::var_os("FNM_DIR").filter(|value| !value.is_empty()) {
+        roots.push((
+            PathBuf::from(fnm_dir).join("node-versions"),
+            PathBuf::from("installation/bin"),
+        ));
+    }
+    if let Some(mise_dir) = env::var_os("MISE_DATA_DIR").filter(|value| !value.is_empty()) {
+        roots.push((
+            PathBuf::from(mise_dir).join("installs/node"),
+            PathBuf::from("bin"),
+        ));
+    }
+
+    for (root, suffix) in roots {
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
-                let candidate = entry.path().join(suffix);
+                let candidate = entry.path().join(&suffix);
                 if candidate.is_dir() {
                     push_unique_path(&mut paths, candidate);
                 }
+            }
+        }
+    }
+
+    let fnm_multishells = home.join(".local/state/fnm_multishells");
+    if let Ok(entries) = std::fs::read_dir(fnm_multishells) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("bin");
+            if candidate.is_dir() {
+                push_unique_path(&mut paths, candidate);
             }
         }
     }
@@ -547,6 +648,11 @@ fn extend_environment_search_paths(paths: &mut Vec<PathBuf>, platform: HostPlatf
     for variable in ["VOLTA_HOME"] {
         if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
             push_unique_path(paths, PathBuf::from(path).join("bin"));
+        }
+    }
+    for variable in ["MISE_DATA_DIR", "ASDF_DATA_DIR"] {
+        if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
+            push_unique_path(paths, PathBuf::from(path).join("shims"));
         }
     }
     for variable in ["SCOOP", "SCOOP_GLOBAL"] {
@@ -715,11 +821,23 @@ fn infer_install_source(path: &Path, real_path: &Path) -> InstallationSource {
         .replace('\\', "/")
         .to_ascii_lowercase();
 
-    if text.contains("/homebrew/") || text.contains("/linuxbrew/") || text.contains("/cellar/") {
+    if text.contains("/.nvm/") {
+        InstallationSource::Nvm
+    } else if text.contains("fnm_multishells") || text.contains("/.fnm/") || text.contains("/fnm/")
+    {
+        InstallationSource::Fnm
+    } else if text.contains("/.mise/") || text.contains("/share/mise/") || text.contains("/mise/") {
+        InstallationSource::Mise
+    } else if text.contains("/homebrew/")
+        || text.contains("/linuxbrew/")
+        || text.contains("/cellar/")
+    {
         InstallationSource::Homebrew
     } else if text.contains("/.local/share/claude/")
         || text.contains("/claude/versions/")
         || text.contains("/.opencode/")
+        || text.contains("/programs/openai/codex/")
+        || text.contains("/programs/claude/")
     {
         InstallationSource::Native
     } else if text.contains("/.local/share/pnpm/") || text.contains("/pnpm/") {
@@ -731,9 +849,6 @@ fn infer_install_source(path: &Path, real_path: &Path) -> InstallationSource {
     } else if text.contains("/scoop/") {
         InstallationSource::Scoop
     } else if text.contains("/node_modules/")
-        || text.contains("/.nvm/")
-        || text.contains("/.fnm/")
-        || text.contains("/.mise/")
         || text.contains("/.npm-global/")
         || text.contains("/appdata/roaming/npm/")
         || text.contains("/appdata/local/npm/")
@@ -788,6 +903,8 @@ mod tests {
         infer_install_source, read_limited, redact_output, HostPlatform, InstallationSource,
         MAX_CAPTURED_OUTPUT_BYTES,
     };
+    #[cfg(not(target_os = "windows"))]
+    use super::{default_flag_for_shell, is_valid_shell, login_shell_path};
     #[cfg(windows)]
     use super::{package_manager_global_bin, paths_match, run_package_manager, PackageManagerRun};
     use std::io::Cursor;
@@ -822,6 +939,9 @@ mod tests {
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect::<Vec<_>>();
         assert!(windows_paths.contains(&"C:/Users/Accly/AppData/Roaming/npm".to_string()));
+        assert!(windows_paths
+            .contains(&"C:/Users/Accly/AppData/Local/Programs/OpenAI/Codex/bin".to_string()));
+        assert!(windows_paths.contains(&"C:/Users/Accly/AppData/Local/Programs/claude".to_string()));
         assert!(windows_paths.contains(&"C:/Users/Accly/scoop/shims".to_string()));
     }
 
@@ -866,6 +986,34 @@ mod tests {
             ),
             InstallationSource::Pnpm
         );
+        assert_eq!(
+            infer_install_source(
+                Path::new("/home/accly/.nvm/versions/node/v22/bin/codex"),
+                Path::new("/home/accly/.nvm/versions/node/v22/bin/codex"),
+            ),
+            InstallationSource::Nvm
+        );
+        assert_eq!(
+            infer_install_source(
+                Path::new("/home/accly/.local/state/fnm_multishells/123/bin/codex"),
+                Path::new("/home/accly/.local/state/fnm_multishells/123/bin/codex"),
+            ),
+            InstallationSource::Fnm
+        );
+        assert_eq!(
+            infer_install_source(
+                Path::new("/home/accly/.local/share/mise/installs/node/22/bin/codex"),
+                Path::new("/home/accly/.local/share/mise/installs/node/22/bin/codex"),
+            ),
+            InstallationSource::Mise
+        );
+        assert_eq!(
+            infer_install_source(
+                Path::new(r"C:\Users\Accly\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"),
+                Path::new(r"C:\Users\Accly\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"),
+            ),
+            InstallationSource::Native
+        );
     }
 
     #[test]
@@ -906,6 +1054,17 @@ mod tests {
         let captured = read_limited(Cursor::new(input));
 
         assert_eq!(captured.len(), MAX_CAPTURED_OUTPUT_BYTES);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn validates_login_shell_candidates() {
+        assert!(is_valid_shell("/bin/zsh"));
+        assert!(is_valid_shell("bash"));
+        assert!(!is_valid_shell("powershell"));
+        assert_eq!(default_flag_for_shell("/bin/zsh"), "-lic");
+        assert_eq!(default_flag_for_shell("/bin/sh"), "-c");
+        assert!(login_shell_path().is_some());
     }
 
     #[cfg(windows)]

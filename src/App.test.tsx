@@ -7,12 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import App, {
-  compatibleModelsForAgent,
-  keyGroupForAgentModel,
-  messageFrom,
-} from "./App";
-import { compatibleModels } from "./lib/native";
+import App, { compatibleModelsForAgent, messageFrom } from "./App";
 
 const nativeMocks = vi.hoisted(() => ({
   getLauncherSession: vi.fn(),
@@ -169,17 +164,6 @@ describe("Accly Launcher", () => {
       "gemini-3.5-flash",
       "gemini-3.1-pro-preview",
     ]);
-  });
-
-  it("uses a universal key for OpenCode's OpenAI-compatible adapter", () => {
-    const claudeModel = compatibleModels.find(
-      (model) => model.id === "claude-sonnet-4-6",
-    );
-    expect(claudeModel).toBeDefined();
-    expect(keyGroupForAgentModel("opencode", claudeModel!)).toBe("universal");
-    expect(keyGroupForAgentModel("claude-code", claudeModel!)).toBe(
-      "anthropic",
-    );
   });
 
   it("keeps polling after a nonterminal device authorization response", async () => {
